@@ -123,7 +123,9 @@ public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessSe
                 User = invitee,
                 Role = role,
                 CreatedDate = now,
-                CreatedBy = "SYSTEM",
+                // data-model.md: the inviter's PublicId (second-model review B3 — was
+                // hardcoded "SYSTEM", discarding who actually granted this access).
+                CreatedBy = callerPublicId.ToString(),
             };
             db.BoardMembers.Add(member);
             await db.SaveChangesAsync(cancellationToken);
@@ -147,7 +149,7 @@ public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessSe
         {
             existingPending.Role = role;
             existingPending.UpdatedDate = now;
-            existingPending.UpdatedBy = "SYSTEM";
+            existingPending.UpdatedBy = callerPublicId.ToString();
             await db.SaveChangesAsync(cancellationToken);
 
             var updatedDto = new PendingInvitationDto(
@@ -165,7 +167,7 @@ public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessSe
             InvitedBy = caller,
             Status = InvitationStatus.Pending,
             CreatedDate = now,
-            CreatedBy = "SYSTEM",
+            CreatedBy = callerPublicId.ToString(),
         };
         db.Invitations.Add(invitation);
         await db.SaveChangesAsync(cancellationToken);
@@ -203,7 +205,7 @@ public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessSe
 
         invitation.Status = InvitationStatus.Revoked;
         invitation.UpdatedDate = DateTime.UtcNow;
-        invitation.UpdatedBy = "SYSTEM";
+        invitation.UpdatedBy = callerPublicId.ToString();
         await db.SaveChangesAsync(cancellationToken);
 
         return Result<Unit>.Success(Unit.Value);

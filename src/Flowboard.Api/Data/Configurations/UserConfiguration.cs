@@ -8,13 +8,19 @@ namespace Flowboard.Api.Data.Configurations;
 
 public sealed class UserConfiguration : IEntityTypeConfiguration<User>
 {
-    // Known test password: "FixtureOwner!2026" — BCrypt hash pre-computed offline (research
-    // R-1/R-2) so the seed stays deterministic; HasData cannot call BCrypt.HashPassword()
-    // itself (a fresh salt every call would make the migration non-reproducible).
+    // Second-model adversarial review B1: this seed is emitted into the PRODUCTION migration
+    // (HasData), so it must never carry a working credential — a real password hash here
+    // would ship a loginable admin account into every database this migration touches.
+    // PlaceholderPasswordHash is a well-formed-but-unverifiable BCrypt hash (no known
+    // plaintext produces it), so PasswordHasher.Verify always returns false against it. The
+    // test host (FlowboardApiFactory.InitializeAsync) overwrites this one row's PasswordHash
+    // with a real, known test hash after migrating — that real hash lives only in the test
+    // project, never in this production model.
     public const int FixtureOwnerId = 1;
     public static readonly Guid FixtureOwnerPublicId = new("00000000-0000-0000-0000-000000000001");
     public const string FixtureOwnerEmail = "fixture-owner@flowboard.test";
-    public const string FixtureOwnerPasswordHash = "$2a$12$QaQbHkSBz2bsEVMr5NPkfun1/.UNcfh5Hthg57fglJoMnzCrxhIJy";
+    public const string FixtureOwnerPlaceholderPasswordHash =
+        "$2a$12$DISABLED.NO.CREDENTIAL.SHIPPED.IN.THIS.MIGRATION.SEED";
     public static readonly DateTime SeedTimestampUtc = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
     public void Configure(EntityTypeBuilder<User> builder)
@@ -46,7 +52,7 @@ public sealed class UserConfiguration : IEntityTypeConfiguration<User>
             Id = FixtureOwnerId,
             PublicId = FixtureOwnerPublicId,
             Email = FixtureOwnerEmail,
-            PasswordHash = FixtureOwnerPasswordHash,
+            PasswordHash = FixtureOwnerPlaceholderPasswordHash,
             DisplayName = "Fixture Owner",
             Initials = "FO",
             AvatarColor = "#64748b",

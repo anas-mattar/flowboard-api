@@ -49,13 +49,20 @@ builder.Services
     });
 builder.Services.AddAuthorization();
 
-// backend-security.md §12: rate limit the login endpoint, partitioned per client IP —
-// a single fixed window with no partition key would let one caller's traffic lock every
-// other caller out of login. Limit is configurable so the test host (no real per-connection
-// IP under WebApplicationFactory) can raise it without touching production defaults.
+// backend-security.md §12: rate limit login AND signup, partitioned per client IP — a
+// single fixed window with no partition key would let one caller's traffic lock every
+// other caller out. Limits are configurable so the test host (no real per-connection IP
+// under WebApplicationFactory) can raise them without touching production defaults.
+// Second-model review H1: signup was originally unlimited despite contracts/auth-api.md
+// requiring it — an unlimited signup is both an email-enumeration oracle (409 "already in
+// use") and a BCrypt-work-factor-12 CPU-exhaustion vector.
 var loginRateLimit = builder.Configuration.GetSection("RateLimiting:Login");
 var loginPermitLimit = loginRateLimit.GetValue("PermitLimit", 10);
 var loginWindowSeconds = loginRateLimit.GetValue("WindowSeconds", 60);
+
+var signupRateLimit = builder.Configuration.GetSection("RateLimiting:Signup");
+var signupPermitLimit = signupRateLimit.GetValue("PermitLimit", 10);
+var signupWindowSeconds = signupRateLimit.GetValue("WindowSeconds", 60);
 
 builder.Services.AddRateLimiter(options =>
 {
@@ -65,6 +72,15 @@ builder.Services.AddRateLimiter(options =>
         {
             Window = TimeSpan.FromSeconds(loginWindowSeconds),
             PermitLimit = loginPermitLimit,
+            QueueLimit = 0,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+        }));
+    options.AddPolicy("auth-signup", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            Window = TimeSpan.FromSeconds(signupWindowSeconds),
+            PermitLimit = signupPermitLimit,
             QueueLimit = 0,
             QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
         }));
