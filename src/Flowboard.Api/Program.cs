@@ -23,6 +23,7 @@ builder.Services.AddSingleton<ITokenService, TokenService>();
 builder.Services.AddScoped<IBoardAccessService, BoardAccessService>();
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddScoped<IBoardMembershipService, BoardMembershipService>();
+builder.Services.AddScoped<IBoardContentService, BoardContentService>();
 
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
     ?? new JwtOptions();
@@ -103,6 +104,7 @@ app.UseRateLimiter();
 app.MapHealthEndpoints();
 app.MapAuthEndpoints();
 app.MapBoardMembersEndpoints();
+app.MapBoardsEndpoints();
 
 app.Run();
 
