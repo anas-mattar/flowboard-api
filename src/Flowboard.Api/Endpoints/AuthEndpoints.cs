@@ -18,7 +18,7 @@ public static class AuthEndpoints
             .WithTags("Auth")
             .AllowAnonymous();
 
-        group.MapPost("/signup", Signup);
+        group.MapPost("/signup", Signup).RequireRateLimiting("auth-signup");
         group.MapPost("/login", Login).RequireRateLimiting("auth-login");
 
         return endpoints;

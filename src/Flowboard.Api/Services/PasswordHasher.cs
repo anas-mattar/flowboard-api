@@ -15,5 +15,17 @@ public sealed class PasswordHasher : IPasswordHasher
 
     public string Hash(string password) => BCrypt.Net.BCrypt.HashPassword(password, workFactor: WorkFactor);
 
-    public bool Verify(string password, string hash) => BCrypt.Net.BCrypt.Verify(password, hash);
+    // A malformed/placeholder hash (e.g. UserConfiguration's unverifiable migration-seed
+    // sentinel, B1) must never verify — and must never crash the caller with a 500 either.
+    public bool Verify(string password, string hash)
+    {
+        try
+        {
+            return BCrypt.Net.BCrypt.Verify(password, hash);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
 }

@@ -232,4 +232,156 @@ public sealed class BoardMembersEndpointTests : IAsyncLifetime
         var afterRemoval = await memberClient.GetAsync($"/v1/boards/{FixtureBoardPublicId}/members");
         Assert.Equal(HttpStatusCode.NotFound, afterRemoval.StatusCode);
     }
+
+    // Second-model adversarial review B3: CreatedBy/UpdatedBy were hardcoded "SYSTEM",
+    // discarding who actually granted or revoked access.
+
+    [Fact]
+    public async Task Invite_RecordsInviterAsCreatedBy()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        using var inviteeSignupClient = _factory.CreateClient();
+        var invitee = await SignUpAsync(inviteeSignupClient, "AuditCreatedBy");
+
+        var response = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(invitee.User.Email, "BoardMember"));
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<FlowboardDbContext>();
+        var member = await db.BoardMembers.AsNoTracking().SingleAsync(
+            m => m.BoardId == BoardConfiguration.FixtureBoardId && m.User.PublicId == invitee.User.PublicId);
+
+        Assert.Equal(UserConfiguration.FixtureOwnerPublicId.ToString(), member.CreatedBy);
+    }
+
+    // Second-model adversarial review F2: DELETE /v1/invitations/{id} had zero coverage.
+
+    [Fact]
+    public async Task RevokeInvitation_ByAdmin_Succeeds()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var email = NewEmail("revoke-me");
+
+        var invite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(email, "Observer"));
+        Assert.Equal(HttpStatusCode.Created, invite.StatusCode);
+        var pending = await invite.Content.ReadFromJsonAsync<PendingInvitationDto>();
+
+        var revoke = await ownerClient.DeleteAsync($"/v1/invitations/{pending!.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, revoke.StatusCode);
+
+        var members = await ownerClient.GetFromJsonAsync<MembersResponse>(
+            $"/v1/boards/{FixtureBoardPublicId}/members");
+        Assert.DoesNotContain(members!.PendingInvitations, p => p.PublicId == pending.PublicId);
+    }
+
+    [Fact]
+    public async Task RevokeInvitation_AlreadyRevoked_Returns404()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var email = NewEmail("revoke-twice");
+
+        var invite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(email, "Observer"));
+        var pending = await invite.Content.ReadFromJsonAsync<PendingInvitationDto>();
+
+        var first = await ownerClient.DeleteAsync($"/v1/invitations/{pending!.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, first.StatusCode);
+
+        var second = await ownerClient.DeleteAsync($"/v1/invitations/{pending.PublicId}");
+        Assert.Equal(HttpStatusCode.NotFound, second.StatusCode);
+    }
+
+    [Fact]
+    public async Task RevokeInvitation_ByNonAdmin_Returns403()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        using var observerSignupClient = _factory.CreateClient();
+        var observer = await SignUpAsync(observerSignupClient, "RevokeNonAdmin");
+
+        var observerInvite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(observer.User.Email, "Observer"));
+        Assert.Equal(HttpStatusCode.Created, observerInvite.StatusCode);
+
+        var targetEmail = NewEmail("revoke-target");
+        var targetInvite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(targetEmail, "Observer"));
+        var targetPending = await targetInvite.Content.ReadFromJsonAsync<PendingInvitationDto>();
+
+        using var observerClient = _factory.CreateClient();
+        Authorize(observerClient, await LogInAsync(observerClient, observer.User.Email, DefaultPassword));
+
+        var revoke = await observerClient.DeleteAsync($"/v1/invitations/{targetPending!.PublicId}");
+        Assert.Equal(HttpStatusCode.Forbidden, revoke.StatusCode);
+    }
+
+    [Fact]
+    public async Task RevokeInvitation_ByUnrelatedUser_Returns404()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var email = NewEmail("revoke-unrelated");
+
+        var invite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(email, "Observer"));
+        var pending = await invite.Content.ReadFromJsonAsync<PendingInvitationDto>();
+
+        using var otherOwnerSignupClient = _factory.CreateClient();
+        var otherOwner = await SignUpAsync(otherOwnerSignupClient, "UnrelatedRevoker");
+        using var otherOwnerClient = _factory.CreateClient();
+        Authorize(otherOwnerClient, await LogInAsync(otherOwnerClient, otherOwner.User.Email, DefaultPassword));
+
+        // otherOwner is admin of their own workspace but has no access to the fixture board —
+        // proves revoke resolves authorization from the invitation's OWN board, not anything
+        // the caller supplies (second-model review F2).
+        var revoke = await otherOwnerClient.DeleteAsync($"/v1/invitations/{pending!.PublicId}");
+        Assert.Equal(HttpStatusCode.NotFound, revoke.StatusCode);
+    }
+
+    // Second-model adversarial review F3: only Observer was tested for 403; BoardMember
+    // (named explicitly in spec.md US4) and the fully-unauthenticated case were untested.
+
+    [Fact]
+    public async Task BoardMemberRole_Gets403OnInviteAndRemove()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        using var memberSignupClient = _factory.CreateClient();
+        var member = await SignUpAsync(memberSignupClient, "BoardMemberRole");
+
+        var invite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations", new InviteRequestBody(member.User.Email, "BoardMember"));
+        Assert.Equal(HttpStatusCode.Created, invite.StatusCode);
+
+        using var memberClient = _factory.CreateClient();
+        Authorize(memberClient, await LogInAsync(memberClient, member.User.Email, DefaultPassword));
+
+        var memberInvite = await memberClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations",
+            new InviteRequestBody(NewEmail("board-member-cant-invite"), "Observer"));
+        Assert.Equal(HttpStatusCode.Forbidden, memberInvite.StatusCode);
+
+        var memberRemove = await memberClient.DeleteAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/members/{member.User.PublicId}");
+        Assert.Equal(HttpStatusCode.Forbidden, memberRemove.StatusCode);
+    }
+
+    [Fact]
+    public async Task Unauthenticated_Gets401OnEveryBoardScopedEndpoint()
+    {
+        using var anonymousClient = _factory.CreateClient();
+
+        var list = await anonymousClient.GetAsync($"/v1/boards/{FixtureBoardPublicId}/members");
+        Assert.Equal(HttpStatusCode.Unauthorized, list.StatusCode);
+
+        var invite = await anonymousClient.PostAsJsonAsync(
+            $"/v1/boards/{FixtureBoardPublicId}/invitations",
+            new InviteRequestBody(NewEmail("anon-invitee"), "Observer"));
+        Assert.Equal(HttpStatusCode.Unauthorized, invite.StatusCode);
+
+        var remove = await anonymousClient.DeleteAsync($"/v1/boards/{FixtureBoardPublicId}/members/{Guid.NewGuid()}");
+        Assert.Equal(HttpStatusCode.Unauthorized, remove.StatusCode);
+
+        var revoke = await anonymousClient.DeleteAsync($"/v1/invitations/{Guid.NewGuid()}");
+        Assert.Equal(HttpStatusCode.Unauthorized, revoke.StatusCode);
+    }
 }
