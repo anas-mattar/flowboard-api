@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Flowboard.Api/Flowboard.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Flowboard.Api.Tests/Flowboard.Api.Tests.csproj" />
+  </Folder>
+</Solution>
