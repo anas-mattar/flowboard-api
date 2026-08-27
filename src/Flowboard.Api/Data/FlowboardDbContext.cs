@@ -16,6 +16,20 @@ public sealed class FlowboardDbContext(DbContextOptions<FlowboardDbContext> opti
 
     public DbSet<Invitation> Invitations => Set<Invitation>();
 
+    public DbSet<List> Lists => Set<List>();
+
+    public DbSet<Card> Cards => Set<Card>();
+
+    public DbSet<Label> Labels => Set<Label>();
+
+    public DbSet<CardLabel> CardLabels => Set<CardLabel>();
+
+    public DbSet<CardMember> CardMembers => Set<CardMember>();
+
+    public DbSet<ChecklistItem> ChecklistItems => Set<ChecklistItem>();
+
+    public DbSet<Comment> Comments => Set<Comment>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(FlowboardDbContext).Assembly);

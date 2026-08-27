@@ -23,6 +23,20 @@ public sealed class UserConfiguration : IEntityTypeConfiguration<User>
         "$2a$12$DISABLED.NO.CREDENTIAL.SHIPPED.IN.THIS.MIGRATION.SEED";
     public static readonly DateTime SeedTimestampUtc = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
+    // specs/003-board-view-readonly/data-model.md Seed data — card-member avatars shown in
+    // screenshots/board-canvas.png (AK/LF/OH/PN/TB). Same non-verifiable placeholder
+    // credential pattern as the fixture owner (wrap-up B1, 002) — no real password ships.
+    public const int FixtureMemberAkId = 2;
+    public static readonly Guid FixtureMemberAkPublicId = new("00000000-0000-0000-0000-000000000004");
+    public const int FixtureMemberLfId = 3;
+    public static readonly Guid FixtureMemberLfPublicId = new("00000000-0000-0000-0000-000000000005");
+    public const int FixtureMemberOhId = 4;
+    public static readonly Guid FixtureMemberOhPublicId = new("00000000-0000-0000-0000-000000000006");
+    public const int FixtureMemberPnId = 5;
+    public static readonly Guid FixtureMemberPnPublicId = new("00000000-0000-0000-0000-000000000007");
+    public const int FixtureMemberTbId = 6;
+    public static readonly Guid FixtureMemberTbPublicId = new("00000000-0000-0000-0000-000000000008");
+
     public void Configure(EntityTypeBuilder<User> builder)
     {
         builder.ToTable("User");
@@ -59,5 +73,67 @@ public sealed class UserConfiguration : IEntityTypeConfiguration<User>
             CreatedDate = SeedTimestampUtc,
             CreatedBy = "MIGRATION",
         });
+
+        builder.HasData(
+            new User
+            {
+                Id = FixtureMemberAkId,
+                PublicId = FixtureMemberAkPublicId,
+                Email = "fixture-member-ak@flowboard.test",
+                PasswordHash = FixtureOwnerPlaceholderPasswordHash,
+                DisplayName = "Aiko Kimura",
+                Initials = "AK",
+                AvatarColor = "#2563eb",
+                CreatedDate = SeedTimestampUtc,
+                CreatedBy = "MIGRATION",
+            },
+            new User
+            {
+                Id = FixtureMemberLfId,
+                PublicId = FixtureMemberLfPublicId,
+                Email = "fixture-member-lf@flowboard.test",
+                PasswordHash = FixtureOwnerPlaceholderPasswordHash,
+                DisplayName = "Luca Ferrari",
+                Initials = "LF",
+                AvatarColor = "#7c3aed",
+                CreatedDate = SeedTimestampUtc,
+                CreatedBy = "MIGRATION",
+            },
+            new User
+            {
+                Id = FixtureMemberOhId,
+                PublicId = FixtureMemberOhPublicId,
+                Email = "fixture-member-oh@flowboard.test",
+                PasswordHash = FixtureOwnerPlaceholderPasswordHash,
+                DisplayName = "Omar Haddad",
+                Initials = "OH",
+                AvatarColor = "#16a34a",
+                CreatedDate = SeedTimestampUtc,
+                CreatedBy = "MIGRATION",
+            },
+            new User
+            {
+                Id = FixtureMemberPnId,
+                PublicId = FixtureMemberPnPublicId,
+                Email = "fixture-member-pn@flowboard.test",
+                PasswordHash = FixtureOwnerPlaceholderPasswordHash,
+                DisplayName = "Priya Nair",
+                Initials = "PN",
+                AvatarColor = "#ea580c",
+                CreatedDate = SeedTimestampUtc,
+                CreatedBy = "MIGRATION",
+            },
+            new User
+            {
+                Id = FixtureMemberTbId,
+                PublicId = FixtureMemberTbPublicId,
+                Email = "fixture-member-tb@flowboard.test",
+                PasswordHash = FixtureOwnerPlaceholderPasswordHash,
+                DisplayName = "Tomás Bravo",
+                Initials = "TB",
+                AvatarColor = "#b91c1c",
+                CreatedDate = SeedTimestampUtc,
+                CreatedBy = "MIGRATION",
+            });
     }
 }

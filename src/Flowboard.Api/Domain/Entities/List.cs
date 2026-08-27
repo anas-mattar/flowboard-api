@@ -1,23 +1,23 @@
-// specs/002-auth-workspaces/data-model.md#Board (schema origin, ADR-11); Color/Starred
-// added by specs/003-board-view-readonly/data-model.md#Board — display-only in this
-// feature, no endpoint sets them yet (006's scope).
+// specs/003-board-view-readonly/data-model.md#List. Soft-delete entity (invariant 4:
+// "Boards, lists and cards"). Position is invariant 2's float-ordering column; no move
+// endpoint exists yet, so seed data assigns fixed values (research.md R-8).
 namespace Flowboard.Api.Domain.Entities;
 
-public sealed class Board
+public sealed class List
 {
     public int Id { get; set; }
 
     public Guid PublicId { get; set; }
 
-    public int WorkspaceId { get; set; }
+    public int BoardId { get; set; }
 
-    public Workspace Workspace { get; set; } = null!;
+    public Board Board { get; set; } = null!;
 
     public string Name { get; set; } = string.Empty;
 
-    public string Color { get; set; } = "#64748b";
+    public double Position { get; set; }
 
-    public bool Starred { get; set; }
+    public int? WipLimit { get; set; }
 
     public DateTime CreatedDate { get; set; }
 
