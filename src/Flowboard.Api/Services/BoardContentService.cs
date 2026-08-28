@@ -173,7 +173,7 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
                         c.PublicId,
                         c.Title,
                         c.DueAt,
-                        ComputeDueStatus(c.DueAt, c.DueComplete, now),
+                        CardDueStatus.Compute(c.DueAt, c.DueComplete, now),
                         HasDescription: !string.IsNullOrEmpty(c.Description),
                         ChecklistDone: checklist?.Done,
                         ChecklistTotal: checklist?.Total,
@@ -188,26 +188,6 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
 
         return Result<BoardContentDto>.Success(
             new BoardContentDto(board.PublicId, board.Name, board.Color, board.Starred, listDtos));
-    }
-
-    private static string? ComputeDueStatus(DateTime? dueAt, bool dueComplete, DateTime now)
-    {
-        if (dueAt is null)
-        {
-            return null;
-        }
-
-        if (dueComplete)
-        {
-            return "complete";
-        }
-
-        if (dueAt.Value < now)
-        {
-            return "overdue";
-        }
-
-        return dueAt.Value <= now.AddDays(2) ? "soon" : "future";
     }
 
     private static string EncodeCursor(bool starred, DateTime createdDate, int id) =>

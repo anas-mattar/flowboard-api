@@ -24,6 +24,7 @@ builder.Services.AddScoped<IBoardAccessService, BoardAccessService>();
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddScoped<IBoardMembershipService, BoardMembershipService>();
 builder.Services.AddScoped<IBoardContentService, BoardContentService>();
+builder.Services.AddScoped<ICardService, CardService>();
 
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
     ?? new JwtOptions();
@@ -105,6 +106,7 @@ app.MapHealthEndpoints();
 app.MapAuthEndpoints();
 app.MapBoardMembersEndpoints();
 app.MapBoardsEndpoints();
+app.MapCardsEndpoints();
 
 app.Run();
 

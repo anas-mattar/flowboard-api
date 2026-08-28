@@ -1,12 +1,12 @@
-// specs/003-board-view-readonly/data-model.md#ChecklistItem. Not exposed individually by
-// this feature's API — GET /v1/boards/{id} returns only the aggregate checklistDone/
-// checklistTotal counts per card. No PublicId yet; a future feature adds one when it
-// starts addressing items individually (check/uncheck/delete).
+// specs/003-board-view-readonly/data-model.md#ChecklistItem. 004 adds PublicId — items are
+// now addressed individually (check/uncheck/delete) via specs/004-card-crud/data-model.md.
 namespace Flowboard.Api.Domain.Entities;
 
 public sealed class ChecklistItem
 {
     public int Id { get; set; }
+
+    public Guid PublicId { get; set; }
 
     public int CardId { get; set; }
 

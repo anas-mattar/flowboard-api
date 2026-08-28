@@ -30,6 +30,8 @@ public sealed class FlowboardDbContext(DbContextOptions<FlowboardDbContext> opti
 
     public DbSet<Comment> Comments => Set<Comment>();
 
+    public DbSet<ActivityEvent> ActivityEvents => Set<ActivityEvent>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(FlowboardDbContext).Assembly);
