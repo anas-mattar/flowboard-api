@@ -18,6 +18,8 @@ public sealed record UpdateChecklistItemRequestBody(bool Done);
 
 public sealed record AddCommentRequestBody(string Body);
 
+public sealed record MoveCardRequestBody(Guid ListPublicId, Guid? BeforeCardPublicId);
+
 public static class CardsEndpoints
 {
     private static readonly HashSet<string> KnownUpdateFields = ["title", "description", "dueAt", "dueComplete"];
@@ -44,6 +46,7 @@ public static class CardsEndpoints
         cards.MapPost("/comments", AddComment);
         cards.MapGet("/activity", GetActivity);
         cards.MapPost("/copy", CopyCard);
+        cards.MapPost("/move", MoveCard);
 
         var checklistItems = endpoints.MapGroup("/v1/checklist-items/{checklistItemPublicId:guid}")
             .WithTags("Cards")
@@ -275,6 +278,21 @@ public static class CardsEndpoints
 
         var result = await service.CopyCardAsync(cardPublicId, callerPublicId.Value, cancellationToken);
         return result.ToHttpResult(card => Results.Json(card, statusCode: StatusCodes.Status201Created));
+    }
+
+    // contracts/move-api.md — POST /v1/cards/{cardPublicId}/move.
+    private static async Task<IResult> MoveCard(
+        Guid cardPublicId, MoveCardRequestBody body, ClaimsPrincipal caller, ICardService service, CancellationToken cancellationToken)
+    {
+        var callerPublicId = caller.GetUserPublicId();
+        if (callerPublicId is null)
+        {
+            return Results.Unauthorized();
+        }
+
+        var command = new MoveCardCommand(body.ListPublicId, body.BeforeCardPublicId);
+        var result = await service.MoveCardAsync(cardPublicId, callerPublicId.Value, command, cancellationToken);
+        return result.ToHttpResult();
     }
 
     private static (UpdateCardCommand? Command, Failure? Failure) ParseUpdateCommand(JsonElement body)

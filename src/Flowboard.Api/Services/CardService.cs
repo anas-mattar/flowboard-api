@@ -37,6 +37,8 @@ public sealed record UpdateCardCommand(
     bool HasDueAt, DateTime? DueAt,
     bool HasDueComplete, bool DueComplete);
 
+public sealed record MoveCardCommand(Guid ListPublicId, Guid? BeforeCardPublicId);
+
 public interface ICardService
 {
     Task<Result<CardSummaryDto>> CreateCardAsync(
@@ -81,6 +83,9 @@ public interface ICardService
 
     Task<Result<Unit>> DeleteCardAsync(
         Guid cardPublicId, Guid callerPublicId, CancellationToken cancellationToken);
+
+    Task<Result<Unit>> MoveCardAsync(
+        Guid cardPublicId, Guid callerPublicId, MoveCardCommand command, CancellationToken cancellationToken);
 }
 
 public sealed class CardService(FlowboardDbContext db, IBoardAccessService boardAccess) : ICardService
@@ -700,6 +705,100 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         // No activity event: the card (and its whole feed) is excluded by its own query
         // filter from the moment this saves, so an event here would never be readable.
         await db.SaveChangesAsync(cancellationToken);
+        return Result<Unit>.Success(Unit.Value);
+    }
+
+    // contracts/move-api.md — POST /v1/cards/{cardPublicId}/move.
+    public async Task<Result<Unit>> MoveCardAsync(
+        Guid cardPublicId, Guid callerPublicId, MoveCardCommand command, CancellationToken cancellationToken)
+    {
+        var resolved = await ResolveCardAsync(cardPublicId, callerPublicId, cancellationToken);
+        if (resolved is null)
+        {
+            return Failure.NotFound();
+        }
+        if (!CanMutate(resolved.Access.Role))
+        {
+            return Failure.Forbidden();
+        }
+
+        var card = resolved.Card;
+        var currentBoardId = card.List.BoardId;
+
+        var destinationList = await db.Lists
+            .Where(l => l.PublicId == command.ListPublicId)
+            .Select(l => new { l.Id, l.BoardId, l.Name })
+            .FirstOrDefaultAsync(cancellationToken);
+        if (destinationList is null)
+        {
+            return Failure.NotFound();
+        }
+        if (destinationList.BoardId != currentBoardId)
+        {
+            return Failure.Validation("Validation failed",
+                new Dictionary<string, string[]> { ["listPublicId"] = ["This list belongs to a different board."] });
+        }
+
+        double newPosition;
+        if (command.BeforeCardPublicId is { } beforeCardPublicId)
+        {
+            var beforeSibling = await db.Cards
+                .Where(c => c.PublicId == beforeCardPublicId)
+                .Select(c => new { c.Id, c.ListId, c.Position })
+                .FirstOrDefaultAsync(cancellationToken);
+            if (beforeSibling is null)
+            {
+                return Failure.NotFound();
+            }
+            if (beforeSibling.ListId != destinationList.Id)
+            {
+                return Failure.Validation("Validation failed",
+                    new Dictionary<string, string[]> { ["beforeCardPublicId"] = ["This card is not in the destination list."] });
+            }
+
+            var precedingPosition = await db.Cards
+                .Where(c => c.ListId == destinationList.Id && c.Id != card.Id && c.Position < beforeSibling.Position)
+                .OrderByDescending(c => c.Position)
+                .Select(c => (double?)c.Position)
+                .FirstOrDefaultAsync(cancellationToken);
+            newPosition = Ordering.InsertBetween(precedingPosition ?? 0, beforeSibling.Position);
+        }
+        else
+        {
+            var lastPosition = await db.Cards
+                .Where(c => c.ListId == destinationList.Id && c.Id != card.Id)
+                .OrderByDescending(c => c.Position)
+                .Select(c => (double?)c.Position)
+                .FirstOrDefaultAsync(cancellationToken);
+            newPosition = Ordering.Append(lastPosition);
+        }
+
+        var listChanged = card.ListId != destinationList.Id;
+        var fromListName = card.List.Name;
+        var now = DateTime.UtcNow;
+        var callerIdString = callerPublicId.ToString();
+
+        // ADR-21: moves have no concurrency precondition at all — ExecuteUpdateAsync writes
+        // directly, bypassing the change tracker's RowVersion concurrency check that a normal
+        // SaveChangesAsync on this tracked `card` would otherwise apply. Last write wins.
+        await db.Cards
+            .Where(c => c.Id == card.Id)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(c => c.ListId, destinationList.Id)
+                .SetProperty(c => c.Position, newPosition)
+                .SetProperty(c => c.UpdatedDate, now)
+                .SetProperty(c => c.UpdatedBy, callerIdString),
+                cancellationToken);
+
+        if (listChanged)
+        {
+            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
+            db.ActivityEvents.Add(NewEvent(
+                card, actorId, callerPublicId, ActivityEventType.CardMoved,
+                new { fromListName, toListName = destinationList.Name }));
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
         return Result<Unit>.Success(Unit.Value);
     }
 

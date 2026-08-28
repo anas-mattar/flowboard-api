@@ -18,4 +18,5 @@ public static class ActivityEventType
     public const string ChecklistItemUnchecked = "checklist.item.unchecked";
     public const string ChecklistItemDeleted = "checklist.item.deleted";
     public const string CommentAdded = "comment.added";
+    public const string CardMoved = "card.moved";
 }

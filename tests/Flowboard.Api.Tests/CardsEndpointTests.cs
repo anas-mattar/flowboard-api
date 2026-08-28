@@ -109,10 +109,13 @@ public sealed class CardsEndpointTests : IAsyncLifetime
         return client;
     }
 
-    private async Task<CardSummaryDto> CreateCardAsync(HttpClient client, string titlePrefix)
+    private async Task<CardSummaryDto> CreateCardAsync(HttpClient client, string titlePrefix) =>
+        await CreateCardAsync(client, titlePrefix, BacklogListPublicId);
+
+    private async Task<CardSummaryDto> CreateCardAsync(HttpClient client, string titlePrefix, Guid listPublicId)
     {
         var response = await client.PostAsJsonAsync(
-            $"/v1/lists/{BacklogListPublicId}/cards", new CreateCardRequestBody($"{titlePrefix}-{Guid.NewGuid():N}"));
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody($"{titlePrefix}-{Guid.NewGuid():N}"));
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var card = (await response.Content.ReadFromJsonAsync<CardSummaryDto>())!;
         _cardPublicIds.Add(card.PublicId);
@@ -547,6 +550,135 @@ public sealed class CardsEndpointTests : IAsyncLifetime
 
         var get = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
         Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
+    }
+
+    // ── Move ────────────────────────────────────────────────────────────────
+    // contracts/move-api.md — POST /v1/cards/{cardPublicId}/move.
+
+    [Fact]
+    public async Task MoveCard_SameList_ReordersAndWritesNoActivityEntry()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var first = await CreateCardAsync(ownerClient, "SameListFirst");
+        var second = await CreateCardAsync(ownerClient, "SameListSecond");
+
+        var response = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{second.PublicId}/move", new MoveCardRequestBody(BacklogListPublicId, first.PublicId));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        var backlog = (await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{ProductRoadmapBoardPublicId}"))!
+            .Lists.Single(l => l.PublicId == BacklogListPublicId).Cards;
+        var firstIndex = backlog.ToList().FindIndex(c => c.PublicId == first.PublicId);
+        var secondIndex = backlog.ToList().FindIndex(c => c.PublicId == second.PublicId);
+        Assert.True(secondIndex < firstIndex);
+
+        var activity = await ownerClient.GetFromJsonAsync<CursorPage<ActivityEntryDto>>($"/v1/cards/{second.PublicId}/activity");
+        Assert.DoesNotContain(activity!.Items, e => e.Type == ActivityEventType.CardMoved);
+    }
+
+    [Fact]
+    public async Task MoveCard_CrossList_MovesAndWritesOneActivityEntry()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "CrossListCard");
+
+        var response = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        var detail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
+        Assert.Equal(ListConfiguration.DesignPublicId, detail!.ListPublicId);
+
+        var activity = await ownerClient.GetFromJsonAsync<CursorPage<ActivityEntryDto>>($"/v1/cards/{card.PublicId}/activity");
+        var movedEntries = activity!.Items.Where(e => e.Type == ActivityEventType.CardMoved).ToList();
+        Assert.Single(movedEntries);
+    }
+
+    [Fact]
+    public async Task MoveCard_DestinationOverWipLimit_StillSucceeds()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "OverWipCard");
+
+        // Review is seeded at its WipLimit (2/2) already — the move must not be blocked
+        // (invariant 3, research.md R-6).
+        var response = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.ReviewPublicId, null));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        var board = await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{ProductRoadmapBoardPublicId}");
+        var review = board!.Lists.Single(l => l.PublicId == ListConfiguration.ReviewPublicId);
+        Assert.True(review.CardCount > review.WipLimit);
+    }
+
+    [Fact]
+    public async Task MoveCard_TwoSuccessiveMoves_NeitherIsRejected_LastWriteWins()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "ConcurrentMoveCard");
+
+        var firstMove = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        Assert.Equal(HttpStatusCode.NoContent, firstMove.StatusCode);
+
+        // No If-Match is ever sent for a move (ADR-21) — a second caller unaware of the
+        // first move must still succeed, never 409.
+        var secondMove = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.ReviewPublicId, null));
+        Assert.Equal(HttpStatusCode.NoContent, secondMove.StatusCode);
+
+        var detail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
+        Assert.Equal(ListConfiguration.ReviewPublicId, detail!.ListPublicId);
+    }
+
+    [Fact]
+    public async Task MoveCard_CrossBoardListPublicId_Returns400()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "CrossBoardMoveCard");
+
+        var response = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.MarketingToDoPublicId, null));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task MoveCard_BeforeCardFromDifferentList_Returns400()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "BeforeCardMismatchCard");
+        var foreignSibling = await CreateCardAsync(ownerClient, "ForeignSibling", ListConfiguration.MarketingToDoPublicId);
+
+        var response = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, foreignSibling.PublicId));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task MoveCard_NonMember_Returns404()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "NonMemberMoveCard");
+
+        using var client = _factory.CreateClient();
+        var caller = await SignUpAsync(client, "NonMemberMove");
+        Authorize(client, caller.Token);
+
+        var response = await client.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task MoveCard_Observer_Returns403()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "ObserverMoveCard");
+        using var observerClient = await InvitedClientAsync(ownerClient, "MoveObserver", "Observer");
+
+        var response = await observerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
 
     // ── Permission matrix sweeps ────────────────────────────────────────────
