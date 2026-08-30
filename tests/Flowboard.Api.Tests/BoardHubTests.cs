@@ -420,4 +420,81 @@ public sealed class BoardHubTests : IAsyncLifetime
 
         Assert.DoesNotContain(events, e => e.GetProperty("type").GetString() == "card.created");
     }
+
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return true;
+            }
+
+            await Task.Delay(50);
+        }
+
+        return condition();
+    }
+
+    [Fact]
+    public async Task Reconnect_RejoinsGroupAndReceivesSubsequentEvents_NoDuplicateDelivery()
+    {
+        // specs/008-realtime-sync/tasks.md T027 (FR-008, SC-004): a client that disconnects
+        // and reconnects must explicitly re-JoinBoard (contracts/realtime-api.md's
+        // onreconnected contract — a new connection does not implicitly restore group
+        // membership) to keep receiving BoardEvent messages, and no event may be delivered
+        // more than once across the disconnect/reconnect boundary.
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "HubReconnectOwner");
+        Authorize(ownerClient, owner.Token);
+        var board = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Hub Reconnect Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+        var listPublicId = board.Lists[0].PublicId;
+
+        var token = await GetRealtimeTokenAsync(ownerClient, board.PublicId);
+        var connection = BuildConnection(token);
+        // card.created carries an empty payload (CardService.cs's NewEvent(..., CardCreated,
+        // new { })) — nothing to key on per-card, so this test counts occurrences instead of
+        // matching titles; that's still sufficient to prove no duplicate/replayed delivery.
+        var cardCreatedCount = 0;
+        connection.On<JsonElement>("BoardEvent", evt =>
+        {
+            if (evt.GetProperty("type").GetString() == "card.created")
+            {
+                Interlocked.Increment(ref cardCreatedCount);
+            }
+        });
+
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
+
+        await ownerClient.PostAsJsonAsync(
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card before drop"));
+        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref cardCreatedCount) >= 1, TimeSpan.FromSeconds(10)));
+
+        // Simulate a dropped connection.
+        await connection.StopAsync();
+
+        // A change made by another session while this client is disconnected must not be
+        // queued for later replay — it simply cannot reach a connection that isn't there.
+        await ownerClient.PostAsJsonAsync(
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card while offline"));
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+        // Reconnect and explicitly re-join, exactly as the frontend's onreconnected handler
+        // does (contracts/realtime-api.md) — SignalR assigns a brand-new connection id, so
+        // group membership from before the drop is gone until JoinBoard runs again.
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
+
+        await ownerClient.PostAsJsonAsync(
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card after reconnect"));
+        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref cardCreatedCount) >= 2, TimeSpan.FromSeconds(10)));
+
+        // Exactly the pre-drop and post-reconnect cards were delivered, each exactly once;
+        // the while-offline card was never delivered (no replay) and nothing was duplicated.
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(2, Volatile.Read(ref cardCreatedCount));
+    }
 }
