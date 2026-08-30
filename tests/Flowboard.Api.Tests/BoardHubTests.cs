@@ -307,12 +307,77 @@ public sealed class BoardHubTests : IAsyncLifetime
         Assert.True(containingList.PublicId == destinationAPublicId || containingList.PublicId == destinationBPublicId);
 
         // Exactly two broadcasts were sent — one per accepted move — never lost, never
-        // duplicated, and each still names one of the two requested destinations.
-        Assert.Equal(2, movedEvents.Count);
-        Assert.All(movedEvents, evt => Assert.Contains(
-            evt.GetProperty("payload").GetProperty("toListName").GetString(),
-            new[] { boardContent.Lists.Single(l => l.PublicId == destinationAPublicId).Name,
-                boardContent.Lists.Single(l => l.PublicId == destinationBPublicId).Name }));
+        // duplicated. Comparing the exact sorted multiset (not just "each name is one of
+        // the two") also catches a bug that double-broadcasts one destination while
+        // dropping the other, which a plain per-element containment check would miss.
+        var destinationAName = boardContent.Lists.Single(l => l.PublicId == destinationAPublicId).Name;
+        var destinationBName = boardContent.Lists.Single(l => l.PublicId == destinationBPublicId).Name;
+        var receivedDestinations = movedEvents
+            .Select(evt => evt.GetProperty("payload").GetProperty("toListName").GetString()!)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+        var expectedDestinations = new[] { destinationAName, destinationBName }
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(expectedDestinations, receivedDestinations);
+    }
+
+    [Fact]
+    public async Task UpdateCard_StaleIfMatch_RejectedSaveNeverBroadcasts()
+    {
+        // specs/008-realtime-sync/tasks.md T020 (FR-004): empirically confirms — via an
+        // actual hub connection, not just the activity feed
+        // (CardsEndpointTests.cs's UpdateCard_StaleIfMatch_RejectedSaveNeverPersistsOrBroadcasts
+        // covers that half) — that a rejected concurrent field-edit save produces no
+        // "card.renamed" broadcast at all, only the winning save's.
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "HubStaleConflictOwner");
+        Authorize(ownerClient, owner.Token);
+        var board = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Hub Stale Conflict Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+        var listPublicId = board.Lists[0].PublicId;
+        var card = (await (await ownerClient.PostAsJsonAsync(
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub stale conflict card")))
+            .Content.ReadFromJsonAsync<CardSummaryDto>())!;
+
+        var token = await GetRealtimeTokenAsync(ownerClient, board.PublicId);
+        var connection = BuildConnection(token);
+        var renamedEvents = new List<JsonElement>();
+        connection.On<JsonElement>("BoardEvent", evt =>
+        {
+            if (evt.GetProperty("type").GetString() == "card.renamed")
+            {
+                lock (renamedEvents)
+                {
+                    renamedEvents.Add(evt);
+                }
+            }
+        });
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
+
+        var getResponse = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
+        var staleEtag = getResponse.Headers.ETag!.Tag;
+
+        var winningPatch = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Hub winning save" }),
+        };
+        winningPatch.Headers.TryAddWithoutValidation("If-Match", staleEtag);
+        Assert.Equal(HttpStatusCode.OK, (await ownerClient.SendAsync(winningPatch)).StatusCode);
+
+        var losingPatch = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Hub losing save" }),
+        };
+        losingPatch.Headers.TryAddWithoutValidation("If-Match", staleEtag);
+        Assert.Equal(HttpStatusCode.Conflict, (await ownerClient.SendAsync(losingPatch)).StatusCode);
+
+        // Give any (incorrect) broadcast for the rejected save a moment to arrive.
+        await Task.Delay(TimeSpan.FromSeconds(1));
+
+        var onlyEvent = Assert.Single(renamedEvents);
+        Assert.Equal("Hub winning save", onlyEvent.GetProperty("payload").GetProperty("title").GetString());
     }
 
     [Fact]

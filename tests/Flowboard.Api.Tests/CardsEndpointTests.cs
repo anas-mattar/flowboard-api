@@ -680,37 +680,59 @@ public sealed class CardsEndpointTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task MoveCard_ThenFieldEdit_BothPersist_NeitherErasesTheOther()
+    public async Task MoveCard_ConcurrentWithFieldEdit_NeitherCorruptsNorSilentlyErasesTheOther()
     {
-        // specs/008-realtime-sync/tasks.md T022 (FR-006): a card move (list/position only,
-        // ADR-21's precondition-free ExecuteUpdateAsync) and a field edit (Title/
-        // Description, RowVersion-guarded) touch disjoint columns — confirm persisting one
-        // never reverts the other's already-committed value.
+        // specs/008-realtime-sync/tasks.md T022 (FR-006): a genuinely concurrent
+        // (Task.WhenAll, not sequential) move and field edit on the same card.
+        // Card.RowVersion is a whole-row SQL Server rowversion (CardConfiguration.cs)
+        // shared by both operations' concurrency envelope, so if the move's commit lands
+        // before the field edit's, the field edit is correctly rejected by existing
+        // invariant 6 (matches UpdateCard_StaleIfMatch_RejectedSaveNeverPersistsOrBroadcasts)
+        // rather than silently applied over stale data — that is a rejection, not an
+        // "erasure": it never persisted. This test accepts either legitimate ordering and
+        // asserts the move's effect is never lost, and the losing side (whichever it is)
+        // never corrupts or silently overwrites what actually committed.
         using var ownerClient = await FixtureOwnerClientAsync();
-        var card = await CreateCardAsync(ownerClient, "MoveThenEditCard");
+        var card = await CreateCardAsync(ownerClient, "ConcurrentMoveEditCard");
 
-        var moveResponse = await ownerClient.PostAsJsonAsync(
-            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
-        Assert.Equal(HttpStatusCode.NoContent, moveResponse.StatusCode);
-
-        // The field edit re-fetches its precondition after the move, exactly as a real
-        // client would before typing into an already-open field — RowVersion is a
-        // whole-row SQL Server rowversion (CardConfiguration.cs), so it advances on the
-        // move even though the move never touches Title/Description.
-        var postMoveGet = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
-        var postMoveEtag = postMoveGet.Headers.ETag!.Tag;
+        var getResponse = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
+        var preRaceEtag = getResponse.Headers.ETag!.Tag;
 
         var editRequest = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
         {
-            Content = JsonContent.Create(new { title = "Edited after move", description = "Edited description" }),
+            Content = JsonContent.Create(new { title = "Edited concurrently with move", description = "Edited concurrently" }),
         };
-        editRequest.Headers.TryAddWithoutValidation("If-Match", postMoveEtag);
-        Assert.Equal(HttpStatusCode.OK, (await ownerClient.SendAsync(editRequest)).StatusCode);
+        editRequest.Headers.TryAddWithoutValidation("If-Match", preRaceEtag);
+
+        var moveTask = ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        var editTask = ownerClient.SendAsync(editRequest);
+        var moveResponse = await moveTask;
+        var editResponse = await editTask;
+
+        // The move has no precondition (ADR-21) — it must always land regardless of how
+        // the race resolved for the field edit.
+        Assert.Equal(HttpStatusCode.NoContent, moveResponse.StatusCode);
+        Assert.True(editResponse.StatusCode is HttpStatusCode.OK or HttpStatusCode.Conflict);
 
         var finalDetail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
         Assert.Equal(ListConfiguration.DesignPublicId, finalDetail!.ListPublicId);
-        Assert.Equal("Edited after move", finalDetail.Title);
-        Assert.Equal("Edited description", finalDetail.Description);
+
+        if (editResponse.StatusCode == HttpStatusCode.OK)
+        {
+            // Both operations landed — the move never reverted the field edit's columns,
+            // and the field edit never reverted the move's list/position.
+            Assert.Equal("Edited concurrently with move", finalDetail.Title);
+            Assert.Equal("Edited concurrently", finalDetail.Description);
+        }
+        else
+        {
+            // The field edit lost the race and was rejected outright (409) — it never
+            // persisted, so the card's original title/description are untouched, not
+            // corrupted or partially applied.
+            Assert.Equal(card.Title, finalDetail.Title);
+            Assert.Null(finalDetail.Description);
+        }
     }
 
     [Fact]
