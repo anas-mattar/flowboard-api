@@ -1,6 +1,6 @@
 // specs/002-auth-workspaces/data-model.md#Board (schema origin, ADR-11); Color/Starred
-// added by specs/003-board-view-readonly/data-model.md#Board — display-only in this
-// feature, no endpoint sets them yet (006's scope).
+// added by specs/003-board-view-readonly/data-model.md#Board. RowVersion added by
+// specs/006-board-list-management/data-model.md#Board for rename If-Match concurrency.
 namespace Flowboard.Api.Domain.Entities;
 
 public sealed class Board
@@ -18,6 +18,8 @@ public sealed class Board
     public string Color { get; set; } = "#64748b";
 
     public bool Starred { get; set; }
+
+    public byte[] RowVersion { get; set; } = [];
 
     public DateTime CreatedDate { get; set; }
 

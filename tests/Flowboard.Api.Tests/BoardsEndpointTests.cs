@@ -35,14 +35,7 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
     {
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<FlowboardDbContext>();
-
-        var users = await db.Users.Where(u => _emails.Contains(u.Email)).ToListAsync();
-        var userIds = users.Select(u => u.Id).ToList();
-
-        db.BoardMembers.RemoveRange(await db.BoardMembers.Where(m => userIds.Contains(m.UserId)).ToListAsync());
-        db.Workspaces.RemoveRange(await db.Workspaces.Where(w => userIds.Contains(w.OwnerUserId)).ToListAsync());
-        db.Users.RemoveRange(users);
-        await db.SaveChangesAsync();
+        await TestDataCleanup.RemoveUserOwnedDataAsync(db, _emails);
     }
 
     private string NewEmail(string label)
@@ -74,6 +67,26 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
         var client = _factory.CreateClient();
         Authorize(client, await LogInAsync(client, FixtureOwnerEmail, FixtureOwnerPassword));
         return client;
+    }
+
+    private async Task<HttpClient> InvitedClientAsync(HttpClient ownerClient, Guid boardPublicId, string label, string role)
+    {
+        var signupClient = _factory.CreateClient();
+        var invitee = await SignUpAsync(signupClient, label);
+        var invite = await ownerClient.PostAsJsonAsync(
+            $"/v1/boards/{boardPublicId}/invitations", new InviteRequestBody(invitee.User.Email, role));
+        Assert.Equal(HttpStatusCode.Created, invite.StatusCode);
+
+        var client = _factory.CreateClient();
+        Authorize(client, await LogInAsync(client, invitee.User.Email, DefaultPassword));
+        return client;
+    }
+
+    private static HttpRequestMessage PatchWithIfMatch(string url, object body, string rowVersionBase64)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Patch, url) { Content = JsonContent.Create(body) };
+        request.Headers.Add("If-Match", $"\"{rowVersionBase64}\"");
+        return request;
     }
 
     [Fact]
@@ -266,5 +279,169 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
         var support = await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{CustomerSupportBoardPublicId}");
         Assert.NotNull(support);
         Assert.Equal(2, support!.Lists.Sum(l => l.CardCount));
+    }
+
+    // specs/006-board-list-management/contracts/board-list-management-api.md — POST /v1/boards.
+
+    [Fact]
+    public async Task CreateBoard_ReturnsThreeStarterLists_CreatorIsImplicitAdmin()
+    {
+        using var client = _factory.CreateClient();
+        var user = await SignUpAsync(client, "CreateBoardOwner");
+        Authorize(client, user.Token);
+
+        var response = await client.PostAsJsonAsync("/v1/boards", new CreateBoardRequestBody("Q4 Planning"));
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        var created = await response.Content.ReadFromJsonAsync<BoardCreatedDto>();
+        Assert.NotNull(created);
+        Assert.Equal("Q4 Planning", created!.Name);
+        Assert.False(created.Starred);
+        Assert.Equal(0, created.CardCount);
+        Assert.Equal(["To Do", "Doing", "Done"], created.Lists.Select(l => l.Name).ToArray());
+
+        // No BoardMember row is created for the creator — BoardAccessService already
+        // resolves them as this board's implicit BoardAdmin via workspace ownership.
+        var content = await client.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{created.PublicId}");
+        Assert.NotNull(content);
+        Assert.Equal(["To Do", "Doing", "Done"], content!.Lists.Select(l => l.Name).ToArray());
+        Assert.All(content.Lists, l => Assert.Equal(0, l.CardCount));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task CreateBoard_EmptyOrWhitespaceName_Returns400(string name)
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+
+        var response = await ownerClient.PostAsJsonAsync("/v1/boards", new CreateBoardRequestBody(name));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // specs/006-board-list-management/contracts/board-list-management-api.md — PATCH /v1/boards/{id}.
+
+    [Fact]
+    public async Task UpdateBoard_AsAdmin_Renames_MemberAndObserverForbidden_StaleIfMatchConflicts()
+    {
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "RenameBoardOwner");
+        Authorize(ownerClient, owner.Token);
+
+        var createResponse = await ownerClient.PostAsJsonAsync("/v1/boards", new CreateBoardRequestBody("Original Name"));
+        var board = (await createResponse.Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+
+        var before = await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{board.PublicId}");
+        Assert.NotNull(before);
+
+        var renameResponse = await ownerClient.SendAsync(PatchWithIfMatch(
+            $"/v1/boards/{board.PublicId}", new UpdateBoardRequestBody("Renamed Board"), before!.RowVersion));
+        Assert.Equal(HttpStatusCode.OK, renameResponse.StatusCode);
+
+        var after = await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{board.PublicId}");
+        Assert.NotNull(after);
+        Assert.Equal("Renamed Board", after!.Name);
+        Assert.NotEqual(before.RowVersion, after.RowVersion);
+
+        // Stale If-Match (the pre-rename RowVersion) -> 409.
+        var staleResponse = await ownerClient.SendAsync(PatchWithIfMatch(
+            $"/v1/boards/{board.PublicId}", new UpdateBoardRequestBody("Another Name"), before.RowVersion));
+        Assert.Equal(HttpStatusCode.Conflict, staleResponse.StatusCode);
+
+        // A plain BoardMember cannot rename, even with a fresh RowVersion.
+        using var memberClient = await InvitedClientAsync(ownerClient, board.PublicId, "RenameBoardMember", "BoardMember");
+        var memberResponse = await memberClient.SendAsync(PatchWithIfMatch(
+            $"/v1/boards/{board.PublicId}", new UpdateBoardRequestBody("Member Attempt"), after.RowVersion));
+        Assert.Equal(HttpStatusCode.Forbidden, memberResponse.StatusCode);
+
+        // Neither can an Observer.
+        using var observerClient = await InvitedClientAsync(ownerClient, board.PublicId, "RenameBoardObserver", "Observer");
+        var observerResponse = await observerClient.SendAsync(PatchWithIfMatch(
+            $"/v1/boards/{board.PublicId}", new UpdateBoardRequestBody("Observer Attempt"), after.RowVersion));
+        Assert.Equal(HttpStatusCode.Forbidden, observerResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task UpdateBoard_EmptyOrWhitespaceName_Returns400()
+    {
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "RenameBoardValidation");
+        Authorize(ownerClient, owner.Token);
+
+        var createResponse = await ownerClient.PostAsJsonAsync("/v1/boards", new CreateBoardRequestBody("Original Name"));
+        var board = (await createResponse.Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+        var before = await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{board.PublicId}");
+
+        var response = await ownerClient.SendAsync(PatchWithIfMatch(
+            $"/v1/boards/{board.PublicId}", new UpdateBoardRequestBody("   "), before!.RowVersion));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    // specs/006-board-list-management/contracts/board-list-management-api.md — star/unstar.
+
+    [Fact]
+    public async Task StarBoard_MovesToFrontOfList_UnstarReturnsToNormalOrder_ObserverForbidden()
+    {
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "StarBoardOwner");
+        Authorize(ownerClient, owner.Token);
+
+        var first = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("First Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+        var second = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Second Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+
+        var starResponse = await ownerClient.PostAsync($"/v1/boards/{second.PublicId}/star", content: null);
+        Assert.Equal(HttpStatusCode.NoContent, starResponse.StatusCode);
+
+        var afterStar = await ownerClient.GetFromJsonAsync<CursorPage<BoardSummaryDto>>("/v1/boards");
+        var ownBoards = afterStar!.Items.Where(b => b.PublicId == first.PublicId || b.PublicId == second.PublicId).ToList();
+        Assert.Equal(second.PublicId, ownBoards[0].PublicId);
+        Assert.True(ownBoards[0].Starred);
+
+        var unstarResponse = await ownerClient.PostAsync($"/v1/boards/{second.PublicId}/unstar", content: null);
+        Assert.Equal(HttpStatusCode.NoContent, unstarResponse.StatusCode);
+
+        var afterUnstar = await ownerClient.GetFromJsonAsync<CursorPage<BoardSummaryDto>>("/v1/boards");
+        var secondAfterUnstar = afterUnstar!.Items.Single(b => b.PublicId == second.PublicId);
+        Assert.False(secondAfterUnstar.Starred);
+
+        using var observerClient = await InvitedClientAsync(ownerClient, first.PublicId, "StarBoardObserver", "Observer");
+        var observerResponse = await observerClient.PostAsync($"/v1/boards/{first.PublicId}/star", content: null);
+        Assert.Equal(HttpStatusCode.Forbidden, observerResponse.StatusCode);
+    }
+
+    // specs/006-board-list-management/contracts/board-list-management-api.md — DELETE /v1/boards/{id}.
+
+    [Fact]
+    public async Task DeleteBoard_AsAdmin_RemovesFromEveryMembersList_MemberForbidden_SecondDeleteIs404()
+    {
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "DeleteBoardOwner");
+        Authorize(ownerClient, owner.Token);
+
+        var board = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Board To Delete"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+
+        using var memberClient = await InvitedClientAsync(ownerClient, board.PublicId, "DeleteBoardMember", "BoardMember");
+        var memberDeleteResponse = await memberClient.DeleteAsync($"/v1/boards/{board.PublicId}");
+        Assert.Equal(HttpStatusCode.Forbidden, memberDeleteResponse.StatusCode);
+
+        var memberListBefore = await memberClient.GetFromJsonAsync<CursorPage<BoardSummaryDto>>("/v1/boards");
+        Assert.Contains(memberListBefore!.Items, b => b.PublicId == board.PublicId);
+
+        var deleteResponse = await ownerClient.DeleteAsync($"/v1/boards/{board.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, deleteResponse.StatusCode);
+
+        var ownerListAfter = await ownerClient.GetFromJsonAsync<CursorPage<BoardSummaryDto>>("/v1/boards");
+        Assert.DoesNotContain(ownerListAfter!.Items, b => b.PublicId == board.PublicId);
+
+        var memberListAfter = await memberClient.GetFromJsonAsync<CursorPage<BoardSummaryDto>>("/v1/boards");
+        Assert.DoesNotContain(memberListAfter!.Items, b => b.PublicId == board.PublicId);
+
+        var secondDeleteResponse = await ownerClient.DeleteAsync($"/v1/boards/{board.PublicId}");
+        Assert.Equal(HttpStatusCode.NotFound, secondDeleteResponse.StatusCode);
     }
 }

@@ -46,6 +46,9 @@ public sealed class BoardConfiguration : IEntityTypeConfiguration<Board>
         builder.Property(x => x.Color).HasMaxLength(20).IsRequired().HasDefaultValue("#64748b");
         builder.Property(x => x.Starred).HasDefaultValue(false);
 
+        // database-rules.md: RowVersion required for 006's board rename If-Match.
+        builder.Property(x => x.RowVersion).IsRowVersion();
+
         builder.Property(x => x.CreatedDate).HasColumnType("datetime2").IsRequired();
         builder.Property(x => x.CreatedBy).HasMaxLength(100).IsRequired();
         builder.Property(x => x.UpdatedDate).HasColumnType("datetime2");

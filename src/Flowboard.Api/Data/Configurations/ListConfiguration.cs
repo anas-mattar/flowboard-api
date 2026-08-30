@@ -40,6 +40,9 @@ public sealed class ListConfiguration : IEntityTypeConfiguration<List>
         builder.Property(x => x.Position).IsRequired();
         builder.Property(x => x.WipLimit);
 
+        // database-rules.md: RowVersion required for 006's list rename If-Match.
+        builder.Property(x => x.RowVersion).IsRowVersion();
+
         builder.Property(x => x.CreatedDate).HasColumnType("datetime2").IsRequired();
         builder.Property(x => x.CreatedBy).HasMaxLength(100).IsRequired();
         builder.Property(x => x.UpdatedDate).HasColumnType("datetime2");
