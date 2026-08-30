@@ -1,6 +1,7 @@
 // specs/003-board-view-readonly/data-model.md#List. Soft-delete entity (invariant 4:
-// "Boards, lists and cards"). Position is invariant 2's float-ordering column; no move
-// endpoint exists yet, so seed data assigns fixed values (research.md R-8).
+// "Boards, lists and cards"). Position is invariant 2's float-ordering column. RowVersion
+// added by specs/006-board-list-management/data-model.md#List for rename If-Match
+// concurrency.
 namespace Flowboard.Api.Domain.Entities;
 
 public sealed class List
@@ -18,6 +19,8 @@ public sealed class List
     public double Position { get; set; }
 
     public int? WipLimit { get; set; }
+
+    public byte[] RowVersion { get; set; } = [];
 
     public DateTime CreatedDate { get; set; }
 

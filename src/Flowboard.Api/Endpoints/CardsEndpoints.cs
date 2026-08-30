@@ -90,7 +90,7 @@ public static class CardsEndpoints
             return result.Failure!.ToHttpResult();
         }
 
-        httpContext.Response.Headers.ETag = ToETag(result.Value.RowVersion);
+        httpContext.Response.Headers.ETag = ETagHeader.ToETag(result.Value.RowVersion);
         return Results.Ok(result.Value.Detail);
     }
 
@@ -114,7 +114,7 @@ public static class CardsEndpoints
             return parseFailure.ToHttpResult();
         }
 
-        if (!TryParseETag(httpContext.Request.Headers.IfMatch.ToString(), out var rowVersion))
+        if (!ETagHeader.TryParse(httpContext.Request.Headers.IfMatch.ToString(), out var rowVersion))
         {
             return Failure.Validation("Validation failed",
                 new Dictionary<string, string[]> { ["If-Match"] = ["A valid If-Match header is required."] }).ToHttpResult();
@@ -126,7 +126,7 @@ public static class CardsEndpoints
             return result.Failure!.ToHttpResult();
         }
 
-        httpContext.Response.Headers.ETag = ToETag(result.Value.RowVersion);
+        httpContext.Response.Headers.ETag = ETagHeader.ToETag(result.Value.RowVersion);
         return Results.Ok(result.Value.Detail);
     }
 
@@ -394,35 +394,4 @@ public static class CardsEndpoints
         return (new UpdateCardCommand(hasTitle, title, hasDescription, description, hasDueAt, dueAt, hasDueComplete, dueComplete), null);
     }
 
-    private static string ToETag(byte[] rowVersion) => $"\"{Convert.ToBase64String(rowVersion)}\"";
-
-    private static bool TryParseETag(string? etag, out byte[] rowVersion)
-    {
-        rowVersion = [];
-        if (string.IsNullOrWhiteSpace(etag))
-        {
-            return false;
-        }
-
-        var trimmed = etag.Trim();
-        if (trimmed.StartsWith("W/", StringComparison.Ordinal))
-        {
-            trimmed = trimmed[2..];
-        }
-
-        if (trimmed.Length >= 2 && trimmed[0] == '"' && trimmed[^1] == '"')
-        {
-            trimmed = trimmed[1..^1];
-        }
-
-        try
-        {
-            rowVersion = Convert.FromBase64String(trimmed);
-            return rowVersion.Length > 0;
-        }
-        catch (FormatException)
-        {
-            return false;
-        }
-    }
 }
