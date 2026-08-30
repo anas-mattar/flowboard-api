@@ -151,6 +151,7 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
 
         return Result<CardSummaryDto>.Success(new CardSummaryDto(
             card.PublicId, card.Title, DueAt: null, DueStatus: null, HasDescription: false,
+            Description: null,
             ChecklistDone: null, ChecklistTotal: null, CommentCount: 0, Labels: [], Members: []));
     }
 
@@ -676,6 +677,7 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             copy.DueAt,
             CardDueStatus.Compute(copy.DueAt, copy.DueComplete, now),
             HasDescription: !string.IsNullOrEmpty(copy.Description),
+            Description: copy.Description,
             ChecklistDone: originalChecklistItems.Count == 0 ? null : 0,
             ChecklistTotal: originalChecklistItems.Count == 0 ? null : originalChecklistItems.Count,
             CommentCount: 0,

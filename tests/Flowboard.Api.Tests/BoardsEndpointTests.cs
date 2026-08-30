@@ -1,4 +1,5 @@
-// Verifies the provider side of specs/003-board-view-readonly/contracts/board-content-api.md.
+// Verifies the provider side of specs/003-board-view-readonly/contracts/board-content-api.md
+// and specs/007-search-filter/contracts/search-filter-addendum.md.
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -189,6 +190,7 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
         Assert.Null(smokeCard.DueAt);
         Assert.Null(smokeCard.DueStatus);
         Assert.False(smokeCard.HasDescription);
+        Assert.Null(smokeCard.Description);
         Assert.Null(smokeCard.ChecklistDone);
         Assert.Null(smokeCard.ChecklistTotal);
         Assert.Equal(0, smokeCard.CommentCount);
@@ -202,6 +204,39 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
         Assert.Null(accessibilityCard.DueAt);
         Assert.Null(accessibilityCard.ChecklistDone);
         Assert.Equal(0, accessibilityCard.CommentCount);
+    }
+
+    [Fact]
+    public async Task GetBoardContent_CardWithDescription_ReturnsDescriptionText()
+    {
+        // Own board (not the shared fixture board) so this test cannot skew the
+        // fixed card counts other tests in this class assert against.
+        using var client = _factory.CreateClient();
+        var user = await SignUpAsync(client, "DescriptionSearchOwner");
+        Authorize(client, user.Token);
+
+        var board = (await (await client.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Description Search Fixture"))).Content
+            .ReadFromJsonAsync<BoardCreatedDto>())!;
+        var listPublicId = board.Lists[0].PublicId;
+
+        var created = (await (await client.PostAsJsonAsync(
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Description search card")))
+            .Content.ReadFromJsonAsync<CardSummaryDto>())!;
+
+        var etag = (await client.GetAsync($"/v1/cards/{created.PublicId}")).Headers.ETag!.Tag;
+        var patchRequest = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{created.PublicId}")
+        {
+            Content = JsonContent.Create(new { description = "Matches search text (007-search-filter)." }),
+        };
+        patchRequest.Headers.TryAddWithoutValidation("If-Match", etag);
+        await client.SendAsync(patchRequest);
+
+        var refetched = await client.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{board.PublicId}");
+        var card = refetched!.Lists[0].Cards.Single(c => c.PublicId == created.PublicId);
+
+        Assert.True(card.HasDescription);
+        Assert.Equal("Matches search text (007-search-filter).", card.Description);
     }
 
     [Fact]
