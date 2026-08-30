@@ -88,7 +88,8 @@ public interface ICardService
         Guid cardPublicId, Guid callerPublicId, MoveCardCommand command, CancellationToken cancellationToken);
 }
 
-public sealed class CardService(FlowboardDbContext db, IBoardAccessService boardAccess) : ICardService
+public sealed class CardService(FlowboardDbContext db, IBoardAccessService boardAccess, IBoardEventPublisher realtime)
+    : ICardService
 {
     private static readonly JsonSerializerOptions PayloadJsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -144,10 +145,12 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         };
         db.Cards.Add(card);
 
-        var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-        db.ActivityEvents.Add(NewEvent(card, actorId, callerPublicId, ActivityEventType.CardCreated, new { }));
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var activityEvent = NewEvent(card, actor.Id, callerPublicId, ActivityEventType.CardCreated, new { });
+        db.ActivityEvents.Add(activityEvent);
 
         await db.SaveChangesAsync(cancellationToken);
+        await PublishActivityEventAsync(list.BoardPublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
 
         return Result<CardSummaryDto>.Success(new CardSummaryDto(
             card.PublicId, card.Title, DueAt: null, DueStatus: null, HasDescription: false,
@@ -190,26 +193,26 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
 
         var card = resolved.Card;
         var now = DateTime.UtcNow;
-        var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
         var events = new List<ActivityEvent>();
 
         if (command.HasTitle)
         {
             card.Title = command.Title!.Trim();
-            events.Add(NewEvent(card, actorId, callerPublicId, ActivityEventType.CardRenamed, new { title = card.Title }));
+            events.Add(NewEvent(card, actor.Id, callerPublicId, ActivityEventType.CardRenamed, new { title = card.Title }));
         }
 
         if (command.HasDescription)
         {
             card.Description = string.IsNullOrEmpty(command.Description) ? null : command.Description;
-            events.Add(NewEvent(card, actorId, callerPublicId, ActivityEventType.CardDescribed, new { }));
+            events.Add(NewEvent(card, actor.Id, callerPublicId, ActivityEventType.CardDescribed, new { }));
         }
 
         if (command.HasDueAt)
         {
             card.DueAt = command.DueAt;
             events.Add(NewEvent(
-                card, actorId, callerPublicId,
+                card, actor.Id, callerPublicId,
                 command.DueAt is null ? ActivityEventType.DueCleared : ActivityEventType.DueSet,
                 command.DueAt is null ? new { } : new { dueAt = command.DueAt }));
         }
@@ -219,7 +222,7 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             card.DueComplete = command.DueComplete;
             if (command.DueComplete)
             {
-                events.Add(NewEvent(card, actorId, callerPublicId, ActivityEventType.DueCompleted, new { }));
+                events.Add(NewEvent(card, actor.Id, callerPublicId, ActivityEventType.DueCompleted, new { }));
             }
         }
 
@@ -236,6 +239,12 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         catch (DbUpdateConcurrencyException)
         {
             return Failure.Conflict("This card was changed by someone else.");
+        }
+
+        var boardPublicId = card.List.Board.PublicId;
+        foreach (var activityEvent in events)
+        {
+            await PublishActivityEventAsync(boardPublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
         }
 
         var dto = await BuildDetailDtoAsync(card, cancellationToken);
@@ -277,9 +286,11 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             {
                 Card = card, LabelId = label.Id, CreatedDate = DateTime.UtcNow, CreatedBy = callerPublicId.ToString(),
             });
-            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-            db.ActivityEvents.Add(NewEvent(card, actorId, callerPublicId, ActivityEventType.LabelAdded, new { labelName = label.Name }));
+            var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+            var activityEvent = NewEvent(card, actor.Id, callerPublicId, ActivityEventType.LabelAdded, new { labelName = label.Name });
+            db.ActivityEvents.Add(activityEvent);
             await db.SaveChangesAsync(cancellationToken);
+            await PublishActivityEventAsync(card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
         }
 
         return Result<Unit>.Success(Unit.Value);
@@ -305,9 +316,12 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         {
             var labelName = cardLabel.Label.Name;
             db.CardLabels.Remove(cardLabel);
-            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-            db.ActivityEvents.Add(NewEvent(resolved.Card, actorId, callerPublicId, ActivityEventType.LabelRemoved, new { labelName }));
+            var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+            var activityEvent = NewEvent(resolved.Card, actor.Id, callerPublicId, ActivityEventType.LabelRemoved, new { labelName });
+            db.ActivityEvents.Add(activityEvent);
             await db.SaveChangesAsync(cancellationToken);
+            await PublishActivityEventAsync(
+                resolved.Card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
         }
 
         return Result<Unit>.Success(Unit.Value);
@@ -361,18 +375,27 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
 
         var alreadyCardMember = await db.CardMembers.AnyAsync(
             cm => cm.CardId == card.Id && cm.UserId == user.Id, cancellationToken);
+        ActivityEvent? memberAssignedEvent = null;
+        (int Id, string DisplayName)? actor = null;
         if (!alreadyCardMember)
         {
             db.CardMembers.Add(new CardMember
             {
                 Card = card, UserId = user.Id, CreatedDate = DateTime.UtcNow, CreatedBy = callerPublicId.ToString(),
             });
-            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-            db.ActivityEvents.Add(NewEvent(
-                card, actorId, callerPublicId, ActivityEventType.MemberAssigned, new { memberDisplayName = user.DisplayName }));
+            actor = await GetCallerAsync(callerPublicId, cancellationToken);
+            memberAssignedEvent = NewEvent(
+                card, actor.Value.Id, callerPublicId, ActivityEventType.MemberAssigned, new { memberDisplayName = user.DisplayName });
+            db.ActivityEvents.Add(memberAssignedEvent);
         }
 
         await db.SaveChangesAsync(cancellationToken);
+        if (memberAssignedEvent is not null)
+        {
+            await PublishActivityEventAsync(
+                card.List.Board.PublicId, memberAssignedEvent, callerPublicId, actor!.Value.DisplayName, cancellationToken);
+        }
+
         return Result<Unit>.Success(Unit.Value);
     }
 
@@ -396,10 +419,13 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         {
             var displayName = cardMember.User.DisplayName;
             db.CardMembers.Remove(cardMember);
-            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-            db.ActivityEvents.Add(NewEvent(
-                resolved.Card, actorId, callerPublicId, ActivityEventType.MemberUnassigned, new { memberDisplayName = displayName }));
+            var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+            var activityEvent = NewEvent(
+                resolved.Card, actor.Id, callerPublicId, ActivityEventType.MemberUnassigned, new { memberDisplayName = displayName });
+            db.ActivityEvents.Add(activityEvent);
             await db.SaveChangesAsync(cancellationToken);
+            await PublishActivityEventAsync(
+                resolved.Card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
         }
 
         return Result<Unit>.Success(Unit.Value);
@@ -443,10 +469,12 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         };
         db.ChecklistItems.Add(item);
 
-        var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-        db.ActivityEvents.Add(NewEvent(card, actorId, callerPublicId, ActivityEventType.ChecklistItemAdded, new { text = item.Text }));
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var activityEvent = NewEvent(card, actor.Id, callerPublicId, ActivityEventType.ChecklistItemAdded, new { text = item.Text });
+        db.ActivityEvents.Add(activityEvent);
 
         await db.SaveChangesAsync(cancellationToken);
+        await PublishActivityEventAsync(card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
         return Result<ChecklistItemDetailDto>.Success(new ChecklistItemDetailDto(item.PublicId, item.Text, item.Done));
     }
 
@@ -465,14 +493,23 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
 
         var changed = resolved.Item.Done != done;
         resolved.Item.Done = done;
+        ActivityEvent? activityEvent = null;
+        (int Id, string DisplayName)? actor = null;
         if (changed)
         {
-            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
+            actor = await GetCallerAsync(callerPublicId, cancellationToken);
             var type = done ? ActivityEventType.ChecklistItemChecked : ActivityEventType.ChecklistItemUnchecked;
-            db.ActivityEvents.Add(NewEvent(resolved.Card, actorId, callerPublicId, type, new { text = resolved.Item.Text }));
+            activityEvent = NewEvent(resolved.Card, actor.Value.Id, callerPublicId, type, new { text = resolved.Item.Text });
+            db.ActivityEvents.Add(activityEvent);
         }
 
         await db.SaveChangesAsync(cancellationToken);
+        if (activityEvent is not null)
+        {
+            await PublishActivityEventAsync(
+                resolved.Card.List.Board.PublicId, activityEvent, callerPublicId, actor!.Value.DisplayName, cancellationToken);
+        }
+
         return Result<ChecklistItemDetailDto>.Success(
             new ChecklistItemDetailDto(resolved.Item.PublicId, resolved.Item.Text, resolved.Item.Done));
     }
@@ -492,10 +529,13 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
 
         var text = resolved.Item.Text;
         db.ChecklistItems.Remove(resolved.Item);
-        var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-        db.ActivityEvents.Add(NewEvent(resolved.Card, actorId, callerPublicId, ActivityEventType.ChecklistItemDeleted, new { text }));
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var activityEvent = NewEvent(resolved.Card, actor.Id, callerPublicId, ActivityEventType.ChecklistItemDeleted, new { text });
+        db.ActivityEvents.Add(activityEvent);
 
         await db.SaveChangesAsync(cancellationToken);
+        await PublishActivityEventAsync(
+            resolved.Card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
         return Result<Unit>.Success(Unit.Value);
     }
 
@@ -532,6 +572,8 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         db.ActivityEvents.Add(activityEvent);
 
         await db.SaveChangesAsync(cancellationToken);
+        await PublishActivityEventAsync(
+            resolved.Card.List.Board.PublicId, activityEvent, callerPublicId, caller.DisplayName, cancellationToken);
 
         return Result<ActivityEntryDto>.Success(new ActivityEntryDto(
             activityEvent.Type,
@@ -666,10 +708,13 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             });
         }
 
-        var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-        db.ActivityEvents.Add(NewEvent(copy, actorId, callerPublicId, ActivityEventType.CardCreated, new { }));
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var activityEvent = NewEvent(copy, actor.Id, callerPublicId, ActivityEventType.CardCreated, new { });
+        db.ActivityEvents.Add(activityEvent);
 
         await db.SaveChangesAsync(cancellationToken);
+        await PublishActivityEventAsync(
+            original.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
 
         return Result<CardSummaryDto>.Success(new CardSummaryDto(
             copy.PublicId,
@@ -707,6 +752,14 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         // No activity event: the card (and its whole feed) is excluded by its own query
         // filter from the moment this saves, so an event here would never be readable.
         await db.SaveChangesAsync(cancellationToken);
+
+        // research.md R-5/ADR-35: no ActivityEvent counterpart exists for this action, so
+        // it broadcasts a minimal, live-only event rather than reusing a persisted payload.
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            card.List.Board.PublicId, RealtimeEventType.CardArchived, now, callerPublicId, actor.DisplayName,
+            new { cardPublicId }, cancellationToken);
+
         return Result<Unit>.Success(Unit.Value);
     }
 
@@ -792,13 +845,25 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
                 .SetProperty(c => c.UpdatedBy, callerIdString),
                 cancellationToken);
 
+        var boardPublicId = card.List.Board.PublicId;
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var movePayload = new { fromListName, toListName = destinationList.Name };
+
         if (listChanged)
         {
-            var actorId = await GetCallerIdAsync(callerPublicId, cancellationToken);
-            db.ActivityEvents.Add(NewEvent(
-                card, actorId, callerPublicId, ActivityEventType.CardMoved,
-                new { fromListName, toListName = destinationList.Name }));
+            var activityEvent = NewEvent(card, actor.Id, callerPublicId, ActivityEventType.CardMoved, movePayload);
+            db.ActivityEvents.Add(activityEvent);
             await db.SaveChangesAsync(cancellationToken);
+            await PublishActivityEventAsync(boardPublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
+        }
+        else
+        {
+            // research.md R-5/ADR-35: same-list reordering persists no ActivityEvent (the
+            // ExecuteUpdateAsync above already committed it), but FR-001 still requires the
+            // move itself to be visible live — broadcast without a stored counterpart.
+            await realtime.PublishAsync(
+                boardPublicId, ActivityEventType.CardMoved, now, callerPublicId, actor.DisplayName,
+                movePayload, cancellationToken);
         }
 
         return Result<Unit>.Success(Unit.Value);
@@ -869,8 +934,14 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             checklistItems);
     }
 
-    private async Task<int> GetCallerIdAsync(Guid callerPublicId, CancellationToken cancellationToken) =>
-        await db.Users.Where(u => u.PublicId == callerPublicId).Select(u => u.Id).FirstAsync(cancellationToken);
+    private async Task<(int Id, string DisplayName)> GetCallerAsync(Guid callerPublicId, CancellationToken cancellationToken)
+    {
+        var caller = await db.Users
+            .Where(u => u.PublicId == callerPublicId)
+            .Select(u => new { u.Id, u.DisplayName })
+            .FirstAsync(cancellationToken);
+        return (caller.Id, caller.DisplayName);
+    }
 
     private static ActivityEvent NewEvent(Card card, int actorId, Guid actorPublicId, string type, object payload) =>
         new()
@@ -882,6 +953,17 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             CreatedDate = DateTime.UtcNow,
             CreatedBy = actorPublicId.ToString(),
         };
+
+    // backend-rules.md's Realtime section / ADR-34: called only after the SaveChangesAsync
+    // that persisted `activityEvent` has already succeeded. Deserializes the payload back
+    // to a JsonElement (rather than re-serializing the original object) so the broadcast
+    // carries the exact bytes just committed (invariant 1, FR-003).
+    private Task PublishActivityEventAsync(
+        Guid boardPublicId, ActivityEvent activityEvent, Guid actorPublicId, string actorDisplayName,
+        CancellationToken cancellationToken) =>
+        realtime.PublishAsync(
+            boardPublicId, activityEvent.Type, activityEvent.CreatedDate, actorPublicId, actorDisplayName,
+            JsonSerializer.Deserialize<JsonElement>(activityEvent.Payload), cancellationToken);
 
     private static string EncodeCursor(DateTime createdDate, int id) =>
         Convert.ToBase64String(Encoding.UTF8.GetBytes($"{createdDate:O}|{id}"));

@@ -39,7 +39,7 @@ public interface IBoardMembershipService
         Guid boardPublicId, Guid callerPublicId, Guid memberUserPublicId, CancellationToken cancellationToken);
 }
 
-public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessService boardAccess)
+public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessService boardAccess, IBoardEventPublisher realtime)
     : IBoardMembershipService
 {
     public async Task<Result<MembersResponse>> ListAsync(
@@ -235,6 +235,11 @@ public sealed class BoardMembershipService(FlowboardDbContext db, IBoardAccessSe
 
         db.BoardMembers.Remove(member);
         await db.SaveChangesAsync(cancellationToken);
+
+        // research.md R-7, ADR-38: evict the removed member's live connections to this
+        // board immediately, rather than relying solely on their realtime token's 2-minute
+        // TTL to expire (FR-007).
+        await realtime.EvictUserAsync(boardPublicId, memberUserPublicId, cancellationToken);
 
         return Result<Unit>.Success(Unit.Value);
     }

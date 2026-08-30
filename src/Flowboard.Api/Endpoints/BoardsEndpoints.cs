@@ -28,6 +28,7 @@ public static class BoardsEndpoints
         boards.MapPost("/{boardPublicId:guid}/star", StarBoard);
         boards.MapPost("/{boardPublicId:guid}/unstar", UnstarBoard);
         boards.MapPost("/{boardPublicId:guid}/lists", CreateList);
+        boards.MapPost("/{boardPublicId:guid}/realtime-token", IssueRealtimeToken);
 
         return endpoints;
     }
@@ -162,5 +163,32 @@ public static class BoardsEndpoints
 
         var result = await service.CreateListAsync(boardPublicId, callerPublicId.Value, body.Name, cancellationToken);
         return result.ToHttpResult(list => Results.Json(list, statusCode: StatusCodes.Status201Created));
+    }
+
+    // contracts/realtime-api.md — POST /v1/boards/{boardPublicId}/realtime-token.
+    private static async Task<IResult> IssueRealtimeToken(
+        Guid boardPublicId,
+        ClaimsPrincipal caller,
+        IBoardAccessService boardAccess,
+        ITokenService tokenService,
+        CancellationToken cancellationToken)
+    {
+        var callerPublicId = caller.GetUserPublicId();
+        if (callerPublicId is null)
+        {
+            return Results.Unauthorized();
+        }
+
+        // Any resolvable role (BoardAdmin/BoardMember/Observer) may mint a token — no
+        // resolvable role is a 404, matching the existing "board's existence is not
+        // confirmed to a non-member" rule (002 FR-013).
+        var access = await boardAccess.ResolveAsync(boardPublicId, callerPublicId.Value, cancellationToken);
+        if (access is null)
+        {
+            return Results.NotFound();
+        }
+
+        var issued = tokenService.IssueRealtimeToken(callerPublicId.Value, boardPublicId);
+        return Results.Ok(new { token = issued.Token, expiresAt = issued.ExpiresAtUtc });
     }
 }
