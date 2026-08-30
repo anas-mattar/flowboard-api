@@ -1,5 +1,6 @@
-// Provider side of specs/003-board-view-readonly/contracts/board-content-api.md and
-// specs/006-board-list-management/contracts/board-list-management-api.md.
+// Provider side of specs/003-board-view-readonly/contracts/board-content-api.md,
+// specs/006-board-list-management/contracts/board-list-management-api.md, and
+// specs/007-search-filter/contracts/search-filter-addendum.md.
 using System.Text;
 using Flowboard.Api.Data;
 using Flowboard.Api.Domain;
@@ -25,6 +26,7 @@ public sealed record CardSummaryDto(
     DateTime? DueAt,
     string? DueStatus,
     bool HasDescription,
+    string? Description,
     int? ChecklistDone,
     int? ChecklistTotal,
     int CommentCount,
@@ -207,6 +209,7 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
                         c.DueAt,
                         CardDueStatus.Compute(c.DueAt, c.DueComplete, now),
                         HasDescription: !string.IsNullOrEmpty(c.Description),
+                        Description: c.Description,
                         ChecklistDone: checklist?.Done,
                         ChecklistTotal: checklist?.Total,
                         CommentCount: commentCounts.GetValueOrDefault(c.Id),
