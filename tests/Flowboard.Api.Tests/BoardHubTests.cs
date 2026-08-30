@@ -255,6 +255,67 @@ public sealed class BoardHubTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task MoveCard_TwoConcurrentMoves_ConvergeToOnePosition_NoDuplicateOrLostBroadcast()
+    {
+        // specs/008-realtime-sync/tasks.md T021 (FR-005, SC-003): two concurrent
+        // MoveCardAsync calls on the same card (no If-Match precondition on move, ADR-21 —
+        // last write wins) must converge to exactly one final list, and the hub must
+        // deliver exactly one "card.moved" BoardEvent per accepted move — never a
+        // duplicated or silently dropped broadcast.
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "HubConcurrentMoveOwner");
+        Authorize(ownerClient, owner.Token);
+        var board = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Hub Concurrent Move Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+        var sourceListPublicId = board.Lists[0].PublicId;
+        var destinationAPublicId = board.Lists[1].PublicId;
+        var destinationBPublicId = board.Lists[2].PublicId;
+        var card = (await (await ownerClient.PostAsJsonAsync(
+            $"/v1/lists/{sourceListPublicId}/cards", new CreateCardRequestBody("Concurrent move card")))
+            .Content.ReadFromJsonAsync<CardSummaryDto>())!;
+
+        var token = await GetRealtimeTokenAsync(ownerClient, board.PublicId);
+        var connection = BuildConnection(token);
+        var movedEvents = new List<JsonElement>();
+        connection.On<JsonElement>("BoardEvent", evt =>
+        {
+            if (evt.GetProperty("type").GetString() == "card.moved")
+            {
+                lock (movedEvents)
+                {
+                    movedEvents.Add(evt);
+                }
+            }
+        });
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
+
+        // Two callers move the same card to different lists at nearly the same time.
+        var moveA = ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(destinationAPublicId, null));
+        var moveB = ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(destinationBPublicId, null));
+        var responses = await Task.WhenAll(moveA, moveB);
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.NoContent, r.StatusCode));
+
+        // Give the slower broadcast a moment to arrive.
+        await Task.Delay(TimeSpan.FromSeconds(1));
+
+        var boardContent = await ownerClient.GetFromJsonAsync<BoardContentDto>($"/v1/boards/{board.PublicId}");
+        var listsWithCard = boardContent!.Lists.Where(l => l.Cards.Any(c => c.PublicId == card.PublicId)).ToList();
+        var containingList = Assert.Single(listsWithCard);
+        Assert.True(containingList.PublicId == destinationAPublicId || containingList.PublicId == destinationBPublicId);
+
+        // Exactly two broadcasts were sent — one per accepted move — never lost, never
+        // duplicated, and each still names one of the two requested destinations.
+        Assert.Equal(2, movedEvents.Count);
+        Assert.All(movedEvents, evt => Assert.Contains(
+            evt.GetProperty("payload").GetProperty("toListName").GetString(),
+            new[] { boardContent.Lists.Single(l => l.PublicId == destinationAPublicId).Name,
+                boardContent.Lists.Single(l => l.PublicId == destinationBPublicId).Name }));
+    }
+
+    [Fact]
     public async Task RemoveMember_EvictsConnectedConnection_NoFurtherBoardEvents()
     {
         using var ownerClient = _factory.CreateClient();

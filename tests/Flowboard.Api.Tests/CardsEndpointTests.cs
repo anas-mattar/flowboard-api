@@ -260,6 +260,54 @@ public sealed class CardsEndpointTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task UpdateCard_StaleIfMatch_RejectedSaveNeverPersistsOrBroadcasts()
+    {
+        // specs/008-realtime-sync/tasks.md T020 (FR-004): the losing save must never reach
+        // SaveChangesAsync, so it can never persist an ActivityEvent or reach the
+        // PublishActivityEventAsync call that follows it in CardService.UpdateCardAsync —
+        // proven here via the activity feed rather than a hub connection.
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "RealtimeConflictCard");
+
+        var getResponse = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
+        var staleEtag = getResponse.Headers.ETag!.Tag;
+
+        var winningPatch = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Winning save" }),
+        };
+        winningPatch.Headers.TryAddWithoutValidation("If-Match", staleEtag);
+        Assert.Equal(HttpStatusCode.OK, (await ownerClient.SendAsync(winningPatch)).StatusCode);
+
+        var losingPatch = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Losing save" }),
+        };
+        losingPatch.Headers.TryAddWithoutValidation("If-Match", staleEtag);
+        var losingResponse = await ownerClient.SendAsync(losingPatch);
+        Assert.Equal(HttpStatusCode.Conflict, losingResponse.StatusCode);
+
+        // Member B is shown the current (winning) data, never the rejected write, and can
+        // retry using the fresh ETag it carries (FR-004 acceptance scenario 1).
+        var refetch = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
+        var refetched = await refetch.Content.ReadFromJsonAsync<CardDetailDto>();
+        Assert.Equal("Winning save", refetched!.Title);
+        var freshEtag = refetch.Headers.ETag!.Tag;
+
+        var activity = await ownerClient.GetFromJsonAsync<CursorPage<ActivityEntryDto>>($"/v1/cards/{card.PublicId}/activity");
+        var renamedEntries = activity!.Items.Where(e => e.Type == ActivityEventType.CardRenamed).ToList();
+        var onlyRename = Assert.Single(renamedEntries);
+        Assert.Equal("Winning save", onlyRename.Payload.GetProperty("title").GetString());
+
+        var retryPatch = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Retried after refetch" }),
+        };
+        retryPatch.Headers.TryAddWithoutValidation("If-Match", freshEtag);
+        Assert.Equal(HttpStatusCode.OK, (await ownerClient.SendAsync(retryPatch)).StatusCode);
+    }
+
+    [Fact]
     public async Task UpdateCard_MissingIfMatch_Returns400()
     {
         using var ownerClient = await FixtureOwnerClientAsync();
@@ -629,6 +677,40 @@ public sealed class CardsEndpointTests : IAsyncLifetime
 
         var detail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
         Assert.Equal(ListConfiguration.ReviewPublicId, detail!.ListPublicId);
+    }
+
+    [Fact]
+    public async Task MoveCard_ThenFieldEdit_BothPersist_NeitherErasesTheOther()
+    {
+        // specs/008-realtime-sync/tasks.md T022 (FR-006): a card move (list/position only,
+        // ADR-21's precondition-free ExecuteUpdateAsync) and a field edit (Title/
+        // Description, RowVersion-guarded) touch disjoint columns — confirm persisting one
+        // never reverts the other's already-committed value.
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "MoveThenEditCard");
+
+        var moveResponse = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        Assert.Equal(HttpStatusCode.NoContent, moveResponse.StatusCode);
+
+        // The field edit re-fetches its precondition after the move, exactly as a real
+        // client would before typing into an already-open field — RowVersion is a
+        // whole-row SQL Server rowversion (CardConfiguration.cs), so it advances on the
+        // move even though the move never touches Title/Description.
+        var postMoveGet = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
+        var postMoveEtag = postMoveGet.Headers.ETag!.Tag;
+
+        var editRequest = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Edited after move", description = "Edited description" }),
+        };
+        editRequest.Headers.TryAddWithoutValidation("If-Match", postMoveEtag);
+        Assert.Equal(HttpStatusCode.OK, (await ownerClient.SendAsync(editRequest)).StatusCode);
+
+        var finalDetail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
+        Assert.Equal(ListConfiguration.DesignPublicId, finalDetail!.ListPublicId);
+        Assert.Equal("Edited after move", finalDetail.Title);
+        Assert.Equal("Edited description", finalDetail.Description);
     }
 
     [Fact]
