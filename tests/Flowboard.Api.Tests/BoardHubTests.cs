@@ -444,34 +444,51 @@ public sealed class BoardHubTests : IAsyncLifetime
         // and reconnects must explicitly re-JoinBoard (contracts/realtime-api.md's
         // onreconnected contract — a new connection does not implicitly restore group
         // membership) to keep receiving BoardEvent messages, and no event may be delivered
-        // more than once across the disconnect/reconnect boundary.
+        // more than once, replayed, or dropped across the disconnect/reconnect boundary.
+        //
+        // Uses comment.added (payload carries a distinct `body` per call — unlike
+        // card.created's empty payload) so delivery is asserted by identity and exact
+        // ordered sequence, not just by count: a count-only assertion would pass even if an
+        // event were duplicated while another was silently dropped.
         using var ownerClient = _factory.CreateClient();
         var owner = await SignUpAsync(ownerClient, "HubReconnectOwner");
         Authorize(ownerClient, owner.Token);
         var board = (await (await ownerClient.PostAsJsonAsync(
             "/v1/boards", new CreateBoardRequestBody("Hub Reconnect Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
         var listPublicId = board.Lists[0].PublicId;
+        var card = (await (await ownerClient.PostAsJsonAsync(
+            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card")))
+            .Content.ReadFromJsonAsync<CardSummaryDto>())!;
 
         var token = await GetRealtimeTokenAsync(ownerClient, board.PublicId);
         var connection = BuildConnection(token);
-        // card.created carries an empty payload (CardService.cs's NewEvent(..., CardCreated,
-        // new { })) — nothing to key on per-card, so this test counts occurrences instead of
-        // matching titles; that's still sufficient to prove no duplicate/replayed delivery.
-        var cardCreatedCount = 0;
+        var receivedBodies = new List<string>();
         connection.On<JsonElement>("BoardEvent", evt =>
         {
-            if (evt.GetProperty("type").GetString() == "card.created")
+            if (evt.GetProperty("type").GetString() == "comment.added")
             {
-                Interlocked.Increment(ref cardCreatedCount);
+                lock (receivedBodies)
+                {
+                    receivedBodies.Add(evt.GetProperty("payload").GetProperty("body").GetString()!);
+                }
             }
         });
 
         await connection.StartAsync();
+        var firstConnectionId = connection.ConnectionId;
         await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
 
         await ownerClient.PostAsJsonAsync(
-            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card before drop"));
-        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref cardCreatedCount) >= 1, TimeSpan.FromSeconds(10)));
+            $"/v1/cards/{card.PublicId}/comments", new AddCommentRequestBody("before drop"));
+        Assert.True(await WaitUntilAsync(
+            () => { lock (receivedBodies) { return receivedBodies.Count >= 1; } },
+            TimeSpan.FromSeconds(10)));
+        // Exactly one identified pre-drop event arrived before the drop — an early duplicate
+        // could otherwise silently satisfy a later ">= N" wait without being noticed.
+        lock (receivedBodies)
+        {
+            Assert.Equal(new[] { "before drop" }, receivedBodies);
+        }
 
         // Simulate a dropped connection.
         await connection.StopAsync();
@@ -479,22 +496,33 @@ public sealed class BoardHubTests : IAsyncLifetime
         // A change made by another session while this client is disconnected must not be
         // queued for later replay — it simply cannot reach a connection that isn't there.
         await ownerClient.PostAsJsonAsync(
-            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card while offline"));
+            $"/v1/cards/{card.PublicId}/comments", new AddCommentRequestBody("while offline"));
         await Task.Delay(TimeSpan.FromMilliseconds(500));
 
         // Reconnect and explicitly re-join, exactly as the frontend's onreconnected handler
-        // does (contracts/realtime-api.md) — SignalR assigns a brand-new connection id, so
-        // group membership from before the drop is gone until JoinBoard runs again.
+        // does (contracts/realtime-api.md). Assert SignalR actually assigned a new
+        // connection id — the premise this test relies on (old group membership belonged to
+        // a connection that no longer exists) — rather than assuming it.
         await connection.StartAsync();
+        var secondConnectionId = connection.ConnectionId;
+        Assert.NotNull(firstConnectionId);
+        Assert.NotNull(secondConnectionId);
+        Assert.NotEqual(firstConnectionId, secondConnectionId);
         await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
 
         await ownerClient.PostAsJsonAsync(
-            $"/v1/lists/{listPublicId}/cards", new CreateCardRequestBody("Hub reconnect card after reconnect"));
-        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref cardCreatedCount) >= 2, TimeSpan.FromSeconds(10)));
+            $"/v1/cards/{card.PublicId}/comments", new AddCommentRequestBody("after reconnect"));
+        Assert.True(await WaitUntilAsync(
+            () => { lock (receivedBodies) { return receivedBodies.Count >= 2; } },
+            TimeSpan.FromSeconds(10)));
 
-        // Exactly the pre-drop and post-reconnect cards were delivered, each exactly once;
-        // the while-offline card was never delivered (no replay) and nothing was duplicated.
+        // Exactly the pre-drop and post-reconnect comments were delivered, in order, each
+        // exactly once; the while-offline comment was never delivered (no replay/queueing)
+        // and nothing was duplicated.
         await Task.Delay(TimeSpan.FromMilliseconds(500));
-        Assert.Equal(2, Volatile.Read(ref cardCreatedCount));
+        lock (receivedBodies)
+        {
+            Assert.Equal(new[] { "before drop", "after reconnect" }, receivedBodies);
+        }
     }
 }
