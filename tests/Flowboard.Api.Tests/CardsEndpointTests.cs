@@ -768,14 +768,50 @@ public sealed class CardsEndpointTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task MoveCard_ThenFieldEditWithFreshPrecondition_BothPersist()
+    {
+        // specs/008-realtime-sync/tasks.md T022 (FR-006), deterministic ordering #2 (the
+        // reverse of the test above — a third adversarial-review pass flagged that the
+        // stale-precondition test below, on its own, verifies FR-004's rejection path but
+        // not FR-006's "move-first, both land" outcome): the move commits first, the
+        // caller re-fetches the resulting fresh ETag, and the field edit — now based on
+        // current data — commits after it. Both persist; the move never reverts the
+        // field edit's columns and the field edit never reverts the move's list.
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "MoveThenFreshFieldEditCard");
+
+        var moveResponse = await ownerClient.PostAsJsonAsync(
+            $"/v1/cards/{card.PublicId}/move", new MoveCardRequestBody(ListConfiguration.DesignPublicId, null));
+        Assert.Equal(HttpStatusCode.NoContent, moveResponse.StatusCode);
+
+        var postMoveGet = await ownerClient.GetAsync($"/v1/cards/{card.PublicId}");
+        var postMoveEtag = postMoveGet.Headers.ETag!.Tag;
+
+        var editRequest = new HttpRequestMessage(HttpMethod.Patch, $"/v1/cards/{card.PublicId}")
+        {
+            Content = JsonContent.Create(new { title = "Edited after move", description = "Edited after move description" }),
+        };
+        editRequest.Headers.TryAddWithoutValidation("If-Match", postMoveEtag);
+        Assert.Equal(HttpStatusCode.OK, (await ownerClient.SendAsync(editRequest)).StatusCode);
+
+        var finalDetail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
+        Assert.Equal(ListConfiguration.DesignPublicId, finalDetail!.ListPublicId);
+        Assert.Equal("Edited after move", finalDetail.Title);
+        Assert.Equal("Edited after move description", finalDetail.Description);
+    }
+
+    [Fact]
     public async Task MoveCard_ThenStaleFieldEdit_RejectedWithoutCorruptingTheMove()
     {
-        // specs/008-realtime-sync/tasks.md T022 (FR-006), deterministic ordering #2: the
-        // move commits first, bumping the card's whole-row RowVersion
-        // (CardConfiguration.cs), then a field edit whose precondition predates the move
-        // is submitted. It is correctly rejected (FR-004/invariant 6) rather than
-        // silently applied over stale data — and the move's already-committed position
-        // is untouched by the rejection.
+        // specs/008-realtime-sync/tasks.md T022 (FR-004/invariant 6), a third
+        // deterministic ordering: the move commits first, bumping the card's whole-row
+        // RowVersion (CardConfiguration.cs), then a field edit whose precondition
+        // predates the move is submitted. It is correctly rejected rather than silently
+        // applied over stale data — and the move's already-committed position is
+        // untouched by the rejection. This is deliberately a separate case from the test
+        // above: that one proves FR-006's "both land" outcome when the field edit's
+        // precondition is current; this one proves FR-004's rejection path still holds
+        // when it isn't, with the cause being a concurrent move rather than another edit.
         using var ownerClient = await FixtureOwnerClientAsync();
         var card = await CreateCardAsync(ownerClient, "MoveThenStaleFieldEditCard");
 
