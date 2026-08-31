@@ -266,11 +266,38 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
 
         var allCards = board.Lists.SelectMany(l => l.Cards).ToDictionary(c => c.Title);
 
-        Assert.Equal("future", allCards["Define SSO requirements for Enterprise"].DueStatus);
-        Assert.Equal("future", allCards["Card detail redesign"].DueStatus);
-        Assert.Equal("soon", allCards["Drag & drop performance on large boards"].DueStatus);
-        Assert.Equal("future", allCards["Board member invitations"].DueStatus);
-        Assert.Equal("overdue", allCards["Keyboard shortcuts pass"].DueStatus);
+        // The golden fixture's due dates are seeded relative to migration-apply time
+        // (20260827165840_AddBoardContent.cs's seedNow), not test-run time, so which
+        // bucket ("future"/"soon"/"overdue") a given card falls into drifts as real
+        // wall-clock time passes — a card seeded "1 day from now" eventually becomes
+        // "overdue" no matter how long ago that "now" was. Asserting a hardcoded bucket
+        // name here was a time bomb (confirmed: it flipped on 2026-08-31, on an
+        // otherwise-untouched DB, unrelated to any code change). Instead, recompute the
+        // expected bucket via the production CardDueStatus.Compute domain function, fed
+        // the ground-truth persisted DueAt read directly from the database (not from the
+        // API response under test, so a bug that made the API return a wrong/stale DueAt
+        // would still be caught) — so this assertion stays about whether the API
+        // correctly classifies whatever is actually persisted, not about today's date.
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FlowboardDbContext>();
+            var persistedDueAt = await db.Cards
+                .Where(c => allCards.Keys.Contains(c.Title))
+                .ToDictionaryAsync(c => c.Title, c => c.DueAt);
+
+            var now = DateTime.UtcNow;
+            foreach (var title in new[]
+                     {
+                         "Define SSO requirements for Enterprise", "Card detail redesign",
+                         "Drag & drop performance on large boards", "Board member invitations",
+                         "Keyboard shortcuts pass",
+                     })
+            {
+                // dueComplete: false — the migration seed never sets DueComplete for these
+                // fixture rows, so it keeps its schema default.
+                Assert.Equal(CardDueStatus.Compute(persistedDueAt[title], dueComplete: false, now), allCards[title].DueStatus);
+            }
+        }
         foreach (var title in new[]
                  {
                      "Accessibility audit (WCAG 2.2 AA)", "Prototype smoke card", "Empty-state illustrations",
