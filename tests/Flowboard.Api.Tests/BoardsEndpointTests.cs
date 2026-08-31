@@ -266,11 +266,53 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
 
         var allCards = board.Lists.SelectMany(l => l.Cards).ToDictionary(c => c.Title);
 
-        Assert.Equal("future", allCards["Define SSO requirements for Enterprise"].DueStatus);
-        Assert.Equal("future", allCards["Card detail redesign"].DueStatus);
-        Assert.Equal("soon", allCards["Drag & drop performance on large boards"].DueStatus);
-        Assert.Equal("future", allCards["Board member invitations"].DueStatus);
-        Assert.Equal("overdue", allCards["Keyboard shortcuts pass"].DueStatus);
+        // The golden fixture's due dates are seeded relative to migration-apply time
+        // (20260827165840_AddBoardContent.cs's seedNow), not test-run time, so which
+        // bucket ("future"/"soon"/"overdue") a given card falls into drifts as real
+        // wall-clock time passes — a card seeded "1 day from now" eventually becomes
+        // "overdue" no matter how long ago that "now" was. Asserting a hardcoded bucket
+        // name here was a time bomb (confirmed: it flipped on 2026-08-31, on an
+        // otherwise-untouched DB, unrelated to any code change). Instead, recompute the
+        // expected bucket via the production CardDueStatus.Compute domain function
+        // (CardDueStatusTests.cs independently covers that function's own boundary
+        // correctness with a fixed clock, so this integration check isn't the only thing
+        // standing between a classifier regression and a green build), fed the
+        // ground-truth persisted DueAt read directly from the database — and also assert
+        // that DueAt itself round-trips through the API unchanged, so a bug that returned
+        // a wrong/stale DueAt (while still computing *some* status from it) would still be
+        // caught. There is a theoretical race: the service computes its own `now` when
+        // building the response, and this test computes a separate, slightly later `now`
+        // — if a seeded DueAt sits close enough to the "soon"/"overdue" or "soon"/"future"
+        // boundary, the two computations could disagree. Note that a seeded DueAt *does*
+        // eventually approach these boundaries as wall-clock time passes — that drift is
+        // exactly the mechanism behind the original bug this fix addresses. What's narrow
+        // here is different: for this specific race to flake, the boundary crossing would
+        // have to land in the sub-millisecond gap between the service's `now` and this
+        // test's `now`, not merely "on the same day" — a timing coincidence, not a
+        // date coincidence, so this is not expected to flake in practice even though the
+        // calendar boundary itself is reached routinely.
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<FlowboardDbContext>();
+            var persistedDueAt = await db.Cards
+                .Where(c => allCards.Keys.Contains(c.Title))
+                .ToDictionaryAsync(c => c.Title, c => c.DueAt);
+
+            var now = DateTime.UtcNow;
+            foreach (var title in new[]
+                     {
+                         "Define SSO requirements for Enterprise", "Card detail redesign",
+                         "Drag & drop performance on large boards", "Board member invitations",
+                         "Keyboard shortcuts pass",
+                     })
+            {
+                Assert.Equal(persistedDueAt[title], allCards[title].DueAt);
+
+                // dueComplete: false — the migration seed never sets DueComplete for these
+                // fixture rows, so it keeps its schema default.
+                Assert.Equal(CardDueStatus.Compute(persistedDueAt[title], dueComplete: false, now), allCards[title].DueStatus);
+            }
+        }
         foreach (var title in new[]
                  {
                      "Accessibility audit (WCAG 2.2 AA)", "Prototype smoke card", "Empty-state illustrations",
