@@ -338,4 +338,30 @@ public sealed class AttachmentsEndpointsTests : IAsyncLifetime
         var response = await ownerClient.DeleteAsync($"/v1/attachments/{Guid.NewGuid()}");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
+
+    // ── Activity (T019) ─────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AttachAndRemove_EachWriteExactlyOneCorrectlyShapedActivityEvent()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "AttachmentActivityCard");
+
+        var uploadResponse = await UploadFileAsync(ownerClient, card.PublicId, "spec.pdf", "application/pdf", "%PDF-1.4"u8.ToArray());
+        Assert.Equal(HttpStatusCode.Created, uploadResponse.StatusCode);
+        var uploaded = (await uploadResponse.Content.ReadFromJsonAsync<AttachmentDetailDto>())!;
+
+        var removeResponse = await ownerClient.DeleteAsync($"/v1/attachments/{uploaded.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, removeResponse.StatusCode);
+
+        var activity = await ownerClient.GetFromJsonAsync<CursorPage<ActivityEntryDto>>($"/v1/cards/{card.PublicId}/activity");
+
+        var addedEntries = activity!.Items.Where(e => e.Type == ActivityEventType.AttachmentAdded).ToList();
+        var addedEntry = Assert.Single(addedEntries);
+        Assert.Equal("spec.pdf", addedEntry.Payload.GetProperty("fileName").GetString());
+
+        var removedEntries = activity.Items.Where(e => e.Type == ActivityEventType.AttachmentRemoved).ToList();
+        var removedEntry = Assert.Single(removedEntries);
+        Assert.Equal("spec.pdf", removedEntry.Payload.GetProperty("fileName").GetString());
+    }
 }
