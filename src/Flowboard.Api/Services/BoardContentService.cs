@@ -66,8 +66,12 @@ public interface IBoardContentService
     Task<Result<Unit>> DeleteBoardAsync(Guid boardPublicId, Guid callerPublicId, CancellationToken cancellationToken);
 }
 
-public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessService boardAccess) : IBoardContentService
+public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessService boardAccess, IBoardEventPublisher realtime)
+    : IBoardContentService
 {
+    private async Task<string> GetCallerDisplayNameAsync(Guid callerPublicId, CancellationToken cancellationToken) =>
+        await db.Users.Where(u => u.PublicId == callerPublicId).Select(u => u.DisplayName).FirstAsync(cancellationToken);
+
     // Prototype's own rotating palette (flowboard-prototype.html's `#newBoard` handler);
     // data-model.md: Color stays auto-assigned, never user-editable in this feature.
     private static readonly string[] ColorPalette = ["#3d6df0", "#8f5bff", "#22a06b", "#e2703a", "#c9372c"];
@@ -307,7 +311,8 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
 
         var board = await db.Boards.FirstAsync(b => b.Id == access.BoardId, cancellationToken);
         board.Name = name.Trim();
-        board.UpdatedDate = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        board.UpdatedDate = now;
         board.UpdatedBy = callerPublicId.ToString();
 
         db.Entry(board).Property(x => x.RowVersion).OriginalValue = ifMatchRowVersion;
@@ -320,6 +325,10 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
         {
             return Failure.Conflict("This board was changed by someone else.");
         }
+
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            boardPublicId, RealtimeEventType.BoardRenamed, now, callerPublicId, actorDisplayName, new { }, cancellationToken);
 
         return Result<BoardUpdateResult>.Success(new BoardUpdateResult(board.Name, board.RowVersion));
     }
@@ -345,9 +354,15 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
 
         var board = await db.Boards.FirstAsync(b => b.Id == access.BoardId, cancellationToken);
         board.Starred = starred;
-        board.UpdatedDate = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        board.UpdatedDate = now;
         board.UpdatedBy = callerPublicId.ToString();
         await db.SaveChangesAsync(cancellationToken);
+
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            boardPublicId, starred ? RealtimeEventType.BoardStarred : RealtimeEventType.BoardUnstarred, now,
+            callerPublicId, actorDisplayName, new { }, cancellationToken);
 
         return Result<Unit>.Success(Unit.Value);
     }
@@ -371,6 +386,14 @@ public sealed class BoardContentService(FlowboardDbContext db, IBoardAccessServi
         board.DeletedDate = now;
         board.DeletedBy = callerPublicId.ToString();
         await db.SaveChangesAsync(cancellationToken);
+
+        // research.md R-7, ADR-38: every connection currently viewing this board loses
+        // access instantly, not merely bounded by the realtime token's 2-minute TTL — the
+        // board is gone for everyone, not just the caller (FR-007).
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            boardPublicId, RealtimeEventType.BoardArchived, now, callerPublicId, actorDisplayName, new { }, cancellationToken);
+        await realtime.EvictBoardAsync(boardPublicId, cancellationToken);
 
         return Result<Unit>.Success(Unit.Value);
     }

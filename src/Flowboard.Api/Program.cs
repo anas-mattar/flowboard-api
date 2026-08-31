@@ -1,6 +1,7 @@
 using System.Threading.RateLimiting;
 using Flowboard.Api.Data;
 using Flowboard.Api.Endpoints;
+using Flowboard.Api.Hubs;
 using Flowboard.Api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
@@ -27,6 +28,26 @@ builder.Services.AddScoped<IBoardContentService, BoardContentService>();
 builder.Services.AddScoped<ICardService, CardService>();
 builder.Services.AddScoped<IListService, ListService>();
 
+// plan.md ADR-32/ADR-33: this project's first realtime code — a per-board SignalR hub
+// plus the singleton connection tracker and publish/evict surface every mutating service
+// method calls after its own SaveChangesAsync() (research.md R-4/R-8: no backplane).
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<BoardConnectionTracker>();
+builder.Services.AddSingleton<IBoardEventPublisher, BoardEventPublisher>();
+
+// ADR-33's browser-to-hub connection is cross-origin in every real deployment (the
+// frontend's own host/port, distinct from this API) — unlike every other route, which the
+// browser only ever reaches through the same-origin Next.js BFF. Scoped to the hub
+// endpoint only (see app.MapHub below), not applied to any REST route.
+var realtimeCorsOrigin = builder.Configuration["Cors:RealtimeOrigin"] ?? "http://localhost:3000";
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("Realtime", policy => policy
+        .WithOrigins(realtimeCorsOrigin)
+        .AllowAnyHeader()
+        .WithMethods("GET", "POST"));
+});
+
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
     ?? new JwtOptions();
 
@@ -49,8 +70,33 @@ builder.Services
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromMinutes(1),
         };
+
+        // contracts/realtime-api.md: browser WebSocket/SSE transports cannot carry an
+        // Authorization header, so the SignalR JS client's accessTokenFactory instead
+        // supplies the token as an access_token query-string value — the standard
+        // mechanism for this, scoped to only the hub's own path.
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(accessToken)
+                    && context.HttpContext.Request.Path.StartsWithSegments("/hubs/board"))
+                {
+                    context.Token = accessToken;
+                }
+
+                return Task.CompletedTask;
+            },
+        };
     });
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    // BoardHub's connection policy: requires the realtime token's purpose claim, which a
+    // normal 14-day session JWT never carries — rejected at the hub handshake, never
+    // reaching a hub method (data-model.md's RealtimeTokenClaims, research.md R-3).
+    options.AddPolicy("RealtimeOnly", policy => policy.RequireClaim(TokenService.PurposeClaimType, TokenService.RealtimeTokenPurpose));
+});
 
 // backend-security.md §12: rate limit login AND signup, partitioned per client IP — a
 // single fixed window with no partition key would let one caller's traffic lock every
@@ -99,6 +145,8 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+app.UseCors();
+
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
@@ -109,6 +157,7 @@ app.MapBoardMembersEndpoints();
 app.MapBoardsEndpoints();
 app.MapCardsEndpoints();
 app.MapListsEndpoints();
+app.MapHub<BoardHub>("/hubs/board").RequireAuthorization("RealtimeOnly").RequireCors("Realtime");
 
 app.Run();
 

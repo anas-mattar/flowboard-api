@@ -44,8 +44,12 @@ public interface IListService
     Task<Result<Unit>> SortByDueDateAsync(Guid listPublicId, Guid callerPublicId, CancellationToken cancellationToken);
 }
 
-public sealed class ListService(FlowboardDbContext db, IBoardAccessService boardAccess) : IListService
+public sealed class ListService(FlowboardDbContext db, IBoardAccessService boardAccess, IBoardEventPublisher realtime)
+    : IListService
 {
+    private async Task<string> GetCallerDisplayNameAsync(Guid callerPublicId, CancellationToken cancellationToken) =>
+        await db.Users.Where(u => u.PublicId == callerPublicId).Select(u => u.DisplayName).FirstAsync(cancellationToken);
+
     public async Task<Result<Unit>> MoveListAsync(
         Guid listPublicId, Guid callerPublicId, MoveListCommand command, CancellationToken cancellationToken)
     {
@@ -101,11 +105,18 @@ public sealed class ListService(FlowboardDbContext db, IBoardAccessService board
             newPosition = Ordering.Append(lastPosition);
         }
 
+        var now = DateTime.UtcNow;
         list.Position = newPosition;
-        list.UpdatedDate = DateTime.UtcNow;
+        list.UpdatedDate = now;
         list.UpdatedBy = callerPublicId.ToString();
 
         await db.SaveChangesAsync(cancellationToken);
+
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            list.Board.PublicId, RealtimeEventType.ListMoved, now, callerPublicId, actorDisplayName,
+            new { listPublicId }, cancellationToken);
+
         return Result<Unit>.Success(Unit.Value);
     }
 
@@ -146,6 +157,11 @@ public sealed class ListService(FlowboardDbContext db, IBoardAccessService board
         };
         db.Lists.Add(list);
         await db.SaveChangesAsync(cancellationToken);
+
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            boardPublicId, RealtimeEventType.ListCreated, now, callerPublicId, actorDisplayName,
+            new { listPublicId = list.PublicId }, cancellationToken);
 
         return Result<ListCreatedDto>.Success(new ListCreatedDto(list.PublicId, list.Name, list.WipLimit, CardCount: 0));
     }
@@ -198,7 +214,8 @@ public sealed class ListService(FlowboardDbContext db, IBoardAccessService board
             // list over capacity.
             list.WipLimit = command.WipLimit;
         }
-        list.UpdatedDate = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        list.UpdatedDate = now;
         list.UpdatedBy = callerPublicId.ToString();
 
         db.Entry(list).Property(x => x.RowVersion).OriginalValue = ifMatchRowVersion;
@@ -210,6 +227,20 @@ public sealed class ListService(FlowboardDbContext db, IBoardAccessService board
         catch (DbUpdateConcurrencyException)
         {
             return Failure.Conflict("This list was changed by someone else.");
+        }
+
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        if (command.HasName)
+        {
+            await realtime.PublishAsync(
+                list.Board.PublicId, RealtimeEventType.ListRenamed, now, callerPublicId, actorDisplayName,
+                new { listPublicId }, cancellationToken);
+        }
+        if (command.HasWipLimit)
+        {
+            await realtime.PublishAsync(
+                list.Board.PublicId, RealtimeEventType.ListWipLimitChanged, now, callerPublicId, actorDisplayName,
+                new { listPublicId }, cancellationToken);
         }
 
         return Result<ListUpdateResult>.Success(new ListUpdateResult(list.Name, list.WipLimit, list.RowVersion));
@@ -246,6 +277,22 @@ public sealed class ListService(FlowboardDbContext db, IBoardAccessService board
         }
 
         await db.SaveChangesAsync(cancellationToken);
+
+        // research.md R-5/ADR-35: no ActivityEvent counterpart, matching CardService's own
+        // single-card archive (RealtimeEventType.CardArchived) — one live-only event per
+        // archived card so every viewer's board content re-fetches (FR-013 accepts a burst
+        // of invalidations converging via the existing query client de-duplication).
+        if (cards.Count > 0)
+        {
+            var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+            foreach (var card in cards)
+            {
+                await realtime.PublishAsync(
+                    list.Board.PublicId, RealtimeEventType.CardArchived, now, callerPublicId, actorDisplayName,
+                    new { cardPublicId = card.PublicId }, cancellationToken);
+            }
+        }
+
         return Result<Unit>.Success(Unit.Value);
     }
 
@@ -287,6 +334,20 @@ public sealed class ListService(FlowboardDbContext db, IBoardAccessService board
         list.DeletedBy = callerPublicId.ToString();
 
         await db.SaveChangesAsync(cancellationToken);
+
+        // research.md R-5/ADR-35: no ActivityEvent counterpart for either the list's own
+        // archive or its cascade-archived cards.
+        var actorDisplayName = await GetCallerDisplayNameAsync(callerPublicId, cancellationToken);
+        await realtime.PublishAsync(
+            list.Board.PublicId, RealtimeEventType.ListArchived, now, callerPublicId, actorDisplayName,
+            new { listPublicId }, cancellationToken);
+        foreach (var card in cards)
+        {
+            await realtime.PublishAsync(
+                list.Board.PublicId, RealtimeEventType.CardArchived, now, callerPublicId, actorDisplayName,
+                new { cardPublicId = card.PublicId }, cancellationToken);
+        }
+
         return Result<Unit>.Success(Unit.Value);
     }
 
