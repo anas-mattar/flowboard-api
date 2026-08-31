@@ -280,13 +280,17 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
         // ground-truth persisted DueAt read directly from the database — and also assert
         // that DueAt itself round-trips through the API unchanged, so a bug that returned
         // a wrong/stale DueAt (while still computing *some* status from it) would still be
-        // caught. There is a theoretical, exceedingly narrow race: the service computes
-        // its own `now` when building the response, and this test computes a separate,
-        // slightly later `now` — if a seeded DueAt sat exactly on the "soon"/"overdue" or
-        // "soon"/"future" boundary at that exact instant, the two computations could
-        // disagree. With day-granularity seed offsets against a `seedNow` from a past
-        // migration-apply moment, that instant is never anywhere near the test run, so this
-        // is not expected to flake in practice.
+        // caught. There is a theoretical race: the service computes its own `now` when
+        // building the response, and this test computes a separate, slightly later `now`
+        // — if a seeded DueAt sits close enough to the "soon"/"overdue" or "soon"/"future"
+        // boundary, the two computations could disagree. Note that a seeded DueAt *does*
+        // eventually approach these boundaries as wall-clock time passes — that drift is
+        // exactly the mechanism behind the original bug this fix addresses. What's narrow
+        // here is different: for this specific race to flake, the boundary crossing would
+        // have to land in the sub-millisecond gap between the service's `now` and this
+        // test's `now`, not merely "on the same day" — a timing coincidence, not a
+        // date coincidence, so this is not expected to flake in practice even though the
+        // calendar boundary itself is reached routinely.
         using (var scope = _factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<FlowboardDbContext>();
