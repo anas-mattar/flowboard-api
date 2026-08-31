@@ -22,9 +22,17 @@ public sealed record CardDetailDto(
     string BoardName,
     IReadOnlyList<LabelSummaryDto> Labels,
     IReadOnlyList<MemberUserDto> Members,
-    IReadOnlyList<ChecklistItemDetailDto> ChecklistItems);
+    IReadOnlyList<ChecklistItemDetailDto> ChecklistItems,
+    IReadOnlyList<AttachmentDetailDto> Attachments);
 
 public sealed record ChecklistItemDetailDto(Guid PublicId, string Text, bool Done);
+
+// contracts/attachments-api.md: same shape for the upload response and the card-detail
+// payload's attachments array.
+public sealed record AttachmentDetailDto(
+    Guid PublicId, string FileName, long SizeBytes, MemberUserDto UploadedBy, DateTime CreatedAt);
+
+public sealed record AttachmentContentResult(Stream Content, string ContentType, string FileName);
 
 public sealed record ActivityEntryDto(
     string Type, JsonElement Payload, string ActorDisplayName, string ActorInitials, string ActorAvatarColor, DateTime CreatedAt);
@@ -86,11 +94,28 @@ public interface ICardService
 
     Task<Result<Unit>> MoveCardAsync(
         Guid cardPublicId, Guid callerPublicId, MoveCardCommand command, CancellationToken cancellationToken);
+
+    // contracts/attachments-api.md — POST /v1/cards/{cardPublicId}/attachments.
+    Task<Result<AttachmentDetailDto>> AddAttachmentAsync(
+        Guid cardPublicId, Guid callerPublicId, string fileName, string contentType, long sizeBytes, Stream content,
+        CancellationToken cancellationToken);
+
+    // contracts/attachments-api.md — GET /v1/attachments/{attachmentPublicId}/content.
+    Task<Result<AttachmentContentResult>> GetAttachmentContentAsync(
+        Guid attachmentPublicId, Guid callerPublicId, CancellationToken cancellationToken);
 }
 
-public sealed class CardService(FlowboardDbContext db, IBoardAccessService boardAccess, IBoardEventPublisher realtime)
+public sealed class CardService(
+    FlowboardDbContext db, IBoardAccessService boardAccess, IBoardEventPublisher realtime, IAttachmentStorage attachmentStorage)
     : ICardService
 {
+    // spec.md Assumptions, research.md R-4: the user-visible cap. A separate, higher
+    // server-level limit (AttachmentsEndpoints.cs) exists only as an abuse backstop.
+    private const long MaxAttachmentSizeBytes = 25 * 1024 * 1024;
+
+    private static readonly HashSet<string> BlockedAttachmentExtensions =
+        new(StringComparer.OrdinalIgnoreCase) { ".exe", ".bat", ".sh", ".cmd", ".msi" };
+
     private static readonly JsonSerializerOptions PayloadJsonOptions = new(JsonSerializerDefaults.Web);
 
     private sealed record ResolvedCard(Card Card, BoardAccess Access);
@@ -376,7 +401,7 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         var alreadyCardMember = await db.CardMembers.AnyAsync(
             cm => cm.CardId == card.Id && cm.UserId == user.Id, cancellationToken);
         ActivityEvent? memberAssignedEvent = null;
-        (int Id, string DisplayName)? actor = null;
+        (int Id, string DisplayName, string Initials, string AvatarColor)? actor = null;
         if (!alreadyCardMember)
         {
             db.CardMembers.Add(new CardMember
@@ -494,7 +519,7 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         var changed = resolved.Item.Done != done;
         resolved.Item.Done = done;
         ActivityEvent? activityEvent = null;
-        (int Id, string DisplayName)? actor = null;
+        (int Id, string DisplayName, string Initials, string AvatarColor)? actor = null;
         if (changed)
         {
             actor = await GetCallerAsync(callerPublicId, cancellationToken);
@@ -869,6 +894,87 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
         return Result<Unit>.Success(Unit.Value);
     }
 
+    // contracts/attachments-api.md — POST /v1/cards/{cardPublicId}/attachments (US1).
+    public async Task<Result<AttachmentDetailDto>> AddAttachmentAsync(
+        Guid cardPublicId, Guid callerPublicId, string fileName, string contentType, long sizeBytes, Stream content,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(fileName) || sizeBytes <= 0 || sizeBytes > MaxAttachmentSizeBytes)
+        {
+            return Failure.Validation("Validation failed",
+                new Dictionary<string, string[]> { ["file"] = ["File must be non-empty and no larger than 25 MB."] });
+        }
+
+        var extension = Path.GetExtension(fileName);
+        if (!string.IsNullOrEmpty(extension) && BlockedAttachmentExtensions.Contains(extension))
+        {
+            return Failure.Validation("Validation failed",
+                new Dictionary<string, string[]> { ["file"] = ["This file type is not allowed."] });
+        }
+
+        var resolved = await ResolveCardAsync(cardPublicId, callerPublicId, cancellationToken);
+        if (resolved is null)
+        {
+            return Failure.NotFound();
+        }
+        if (!CanMutate(resolved.Access.Role))
+        {
+            return Failure.Forbidden();
+        }
+
+        var storageKey = await attachmentStorage.SaveAsync(content, cancellationToken);
+
+        var card = resolved.Card;
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var attachment = new Attachment
+        {
+            PublicId = Guid.NewGuid(),
+            Card = card,
+            FileName = fileName,
+            SizeBytes = sizeBytes,
+            ContentType = contentType,
+            StorageKey = storageKey,
+            UploadedById = actor.Id,
+            CreatedDate = DateTime.UtcNow,
+            CreatedBy = callerPublicId.ToString(),
+        };
+        db.Attachments.Add(attachment);
+
+        var activityEvent = NewEvent(card, actor.Id, callerPublicId, ActivityEventType.AttachmentAdded, new { fileName });
+        db.ActivityEvents.Add(activityEvent);
+
+        await db.SaveChangesAsync(cancellationToken);
+        await PublishActivityEventAsync(card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
+
+        return Result<AttachmentDetailDto>.Success(new AttachmentDetailDto(
+            attachment.PublicId, attachment.FileName, attachment.SizeBytes,
+            new MemberUserDto(callerPublicId, actor.DisplayName, actor.Initials, actor.AvatarColor),
+            attachment.CreatedDate));
+    }
+
+    // contracts/attachments-api.md — GET /v1/attachments/{attachmentPublicId}/content (US1/US2:
+    // any resolvable board role, including Observer, may download).
+    public async Task<Result<AttachmentContentResult>> GetAttachmentContentAsync(
+        Guid attachmentPublicId, Guid callerPublicId, CancellationToken cancellationToken)
+    {
+        var attachment = await db.Attachments
+            .Include(a => a.Card).ThenInclude(c => c.List).ThenInclude(l => l.Board)
+            .FirstOrDefaultAsync(a => a.PublicId == attachmentPublicId, cancellationToken);
+        if (attachment is null)
+        {
+            return Failure.NotFound();
+        }
+
+        var access = await boardAccess.ResolveAsync(attachment.Card.List.Board.PublicId, callerPublicId, cancellationToken);
+        if (access is null)
+        {
+            return Failure.NotFound();
+        }
+
+        var stream = await attachmentStorage.OpenReadAsync(attachment.StorageKey, cancellationToken);
+        return Result<AttachmentContentResult>.Success(new AttachmentContentResult(stream, attachment.ContentType, attachment.FileName));
+    }
+
     private static bool CanMutate(BoardRole role) => role is BoardRole.BoardAdmin or BoardRole.BoardMember;
 
     private async Task<ResolvedCard?> ResolveCardAsync(Guid cardPublicId, Guid callerPublicId, CancellationToken cancellationToken)
@@ -918,6 +1024,15 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             .Select(ci => new ChecklistItemDetailDto(ci.PublicId, ci.Text, ci.Done))
             .ToListAsync(cancellationToken);
 
+        var attachments = await db.Attachments.AsNoTracking()
+            .Where(a => a.CardId == card.Id)
+            .OrderBy(a => a.CreatedDate)
+            .Select(a => new AttachmentDetailDto(
+                a.PublicId, a.FileName, a.SizeBytes,
+                new MemberUserDto(a.UploadedBy.PublicId, a.UploadedBy.DisplayName, a.UploadedBy.Initials, a.UploadedBy.AvatarColor),
+                a.CreatedDate))
+            .ToListAsync(cancellationToken);
+
         return new CardDetailDto(
             card.PublicId,
             card.Title,
@@ -931,16 +1046,18 @@ public sealed class CardService(FlowboardDbContext db, IBoardAccessService board
             card.List.Board.Name,
             labels,
             members,
-            checklistItems);
+            checklistItems,
+            attachments);
     }
 
-    private async Task<(int Id, string DisplayName)> GetCallerAsync(Guid callerPublicId, CancellationToken cancellationToken)
+    private async Task<(int Id, string DisplayName, string Initials, string AvatarColor)> GetCallerAsync(
+        Guid callerPublicId, CancellationToken cancellationToken)
     {
         var caller = await db.Users
             .Where(u => u.PublicId == callerPublicId)
-            .Select(u => new { u.Id, u.DisplayName })
+            .Select(u => new { u.Id, u.DisplayName, u.Initials, u.AvatarColor })
             .FirstAsync(cancellationToken);
-        return (caller.Id, caller.DisplayName);
+        return (caller.Id, caller.DisplayName, caller.Initials, caller.AvatarColor);
     }
 
     private static ActivityEvent NewEvent(Card card, int actorId, Guid actorPublicId, string type, object payload) =>

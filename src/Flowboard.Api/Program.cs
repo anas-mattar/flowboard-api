@@ -161,6 +161,7 @@ app.MapAuthEndpoints();
 app.MapBoardMembersEndpoints();
 app.MapBoardsEndpoints();
 app.MapCardsEndpoints();
+app.MapAttachmentsEndpoints();
 app.MapListsEndpoints();
 app.MapHub<BoardHub>("/hubs/board").RequireAuthorization("RealtimeOnly").RequireCors("Realtime");
 
