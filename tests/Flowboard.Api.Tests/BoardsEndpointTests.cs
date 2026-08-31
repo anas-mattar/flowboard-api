@@ -273,11 +273,20 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
         // "overdue" no matter how long ago that "now" was. Asserting a hardcoded bucket
         // name here was a time bomb (confirmed: it flipped on 2026-08-31, on an
         // otherwise-untouched DB, unrelated to any code change). Instead, recompute the
-        // expected bucket via the production CardDueStatus.Compute domain function, fed
-        // the ground-truth persisted DueAt read directly from the database (not from the
-        // API response under test, so a bug that made the API return a wrong/stale DueAt
-        // would still be caught) — so this assertion stays about whether the API
-        // correctly classifies whatever is actually persisted, not about today's date.
+        // expected bucket via the production CardDueStatus.Compute domain function
+        // (CardDueStatusTests.cs independently covers that function's own boundary
+        // correctness with a fixed clock, so this integration check isn't the only thing
+        // standing between a classifier regression and a green build), fed the
+        // ground-truth persisted DueAt read directly from the database — and also assert
+        // that DueAt itself round-trips through the API unchanged, so a bug that returned
+        // a wrong/stale DueAt (while still computing *some* status from it) would still be
+        // caught. There is a theoretical, exceedingly narrow race: the service computes
+        // its own `now` when building the response, and this test computes a separate,
+        // slightly later `now` — if a seeded DueAt sat exactly on the "soon"/"overdue" or
+        // "soon"/"future" boundary at that exact instant, the two computations could
+        // disagree. With day-granularity seed offsets against a `seedNow` from a past
+        // migration-apply moment, that instant is never anywhere near the test run, so this
+        // is not expected to flake in practice.
         using (var scope = _factory.Services.CreateScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<FlowboardDbContext>();
@@ -293,6 +302,8 @@ public sealed class BoardsEndpointTests : IAsyncLifetime
                          "Keyboard shortcuts pass",
                      })
             {
+                Assert.Equal(persistedDueAt[title], allCards[title].DueAt);
+
                 // dueComplete: false — the migration seed never sets DueComplete for these
                 // fixture rows, so it keeps its schema default.
                 Assert.Equal(CardDueStatus.Compute(persistedDueAt[title], dueComplete: false, now), allCards[title].DueStatus);
