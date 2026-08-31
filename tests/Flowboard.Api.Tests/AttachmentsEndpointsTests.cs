@@ -249,4 +249,93 @@ public sealed class AttachmentsEndpointsTests : IAsyncLifetime
         var response = await ownerClient.GetAsync($"/v1/attachments/{Guid.NewGuid()}/content");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
+
+    // ── Remove (T018) ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Remove_ByUploader_Succeeds_WritesActivity_AndDownloadThen404()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "RemoveByUploaderCard");
+        using var memberClient = await InvitedClientAsync(ownerClient, "RemoveUploaderMember", "BoardMember");
+
+        var uploadResponse = await UploadFileAsync(memberClient, card.PublicId, "mine.txt", "text/plain", "mine"u8.ToArray());
+        var uploaded = (await uploadResponse.Content.ReadFromJsonAsync<AttachmentDetailDto>())!;
+
+        var removeResponse = await memberClient.DeleteAsync($"/v1/attachments/{uploaded.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, removeResponse.StatusCode);
+
+        var downloadResponse = await ownerClient.GetAsync($"/v1/attachments/{uploaded.PublicId}/content");
+        Assert.Equal(HttpStatusCode.NotFound, downloadResponse.StatusCode);
+
+        var detail = await ownerClient.GetFromJsonAsync<CardDetailDto>($"/v1/cards/{card.PublicId}");
+        Assert.Empty(detail!.Attachments);
+
+        var activity = await ownerClient.GetFromJsonAsync<CursorPage<ActivityEntryDto>>($"/v1/cards/{card.PublicId}/activity");
+        Assert.Contains(activity!.Items, e => e.Type == ActivityEventType.AttachmentRemoved);
+    }
+
+    [Fact]
+    public async Task Remove_ByBoardAdmin_RemovingSomeoneElsesAttachment_Succeeds()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "RemoveByAdminCard");
+        using var memberClient = await InvitedClientAsync(ownerClient, "RemoveAdminMember", "BoardMember");
+
+        var uploadResponse = await UploadFileAsync(memberClient, card.PublicId, "theirs.txt", "text/plain", "theirs"u8.ToArray());
+        var uploaded = (await uploadResponse.Content.ReadFromJsonAsync<AttachmentDetailDto>())!;
+
+        var removeResponse = await ownerClient.DeleteAsync($"/v1/attachments/{uploaded.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, removeResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task Remove_ByNonUploadingBoardMember_Returns403()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "RemoveForbiddenMemberCard");
+        var uploadResponse = await UploadFileAsync(ownerClient, card.PublicId, "ownerfile.txt", "text/plain", "owner"u8.ToArray());
+        var uploaded = (await uploadResponse.Content.ReadFromJsonAsync<AttachmentDetailDto>())!;
+
+        using var otherMemberClient = await InvitedClientAsync(ownerClient, "RemoveForbiddenMember", "BoardMember");
+        var removeResponse = await otherMemberClient.DeleteAsync($"/v1/attachments/{uploaded.PublicId}");
+        Assert.Equal(HttpStatusCode.Forbidden, removeResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task Remove_ByObserver_Returns403()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "RemoveObserverCard");
+        var uploadResponse = await UploadFileAsync(ownerClient, card.PublicId, "ownerfile2.txt", "text/plain", "owner"u8.ToArray());
+        var uploaded = (await uploadResponse.Content.ReadFromJsonAsync<AttachmentDetailDto>())!;
+
+        using var observerClient = await InvitedClientAsync(ownerClient, "RemoveObserver", "Observer");
+        var removeResponse = await observerClient.DeleteAsync($"/v1/attachments/{uploaded.PublicId}");
+        Assert.Equal(HttpStatusCode.Forbidden, removeResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task Remove_NonMember_Returns404()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var card = await CreateCardAsync(ownerClient, "RemoveNonMemberCard");
+        var uploadResponse = await UploadFileAsync(ownerClient, card.PublicId, "ownerfile3.txt", "text/plain", "owner"u8.ToArray());
+        var uploaded = (await uploadResponse.Content.ReadFromJsonAsync<AttachmentDetailDto>())!;
+
+        using var client = _factory.CreateClient();
+        var caller = await SignUpAsync(client, "RemoveNonMember");
+        Authorize(client, caller.Token);
+
+        var removeResponse = await client.DeleteAsync($"/v1/attachments/{uploaded.PublicId}");
+        Assert.Equal(HttpStatusCode.NotFound, removeResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task Remove_UnknownAttachment_Returns404()
+    {
+        using var ownerClient = await FixtureOwnerClientAsync();
+        var response = await ownerClient.DeleteAsync($"/v1/attachments/{Guid.NewGuid()}");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
 }

@@ -103,6 +103,10 @@ public interface ICardService
     // contracts/attachments-api.md — GET /v1/attachments/{attachmentPublicId}/content.
     Task<Result<AttachmentContentResult>> GetAttachmentContentAsync(
         Guid attachmentPublicId, Guid callerPublicId, CancellationToken cancellationToken);
+
+    // contracts/attachments-api.md — DELETE /v1/attachments/{attachmentPublicId}.
+    Task<Result<Unit>> RemoveAttachmentAsync(
+        Guid attachmentPublicId, Guid callerPublicId, CancellationToken cancellationToken);
 }
 
 public sealed class CardService(
@@ -975,7 +979,58 @@ public sealed class CardService(
         return Result<AttachmentContentResult>.Success(new AttachmentContentResult(stream, attachment.ContentType, attachment.FileName));
     }
 
+    // contracts/attachments-api.md — DELETE /v1/attachments/{attachmentPublicId} (US2).
+    public async Task<Result<Unit>> RemoveAttachmentAsync(
+        Guid attachmentPublicId, Guid callerPublicId, CancellationToken cancellationToken)
+    {
+        var attachment = await db.Attachments
+            .Include(a => a.Card).ThenInclude(c => c.List).ThenInclude(l => l.Board)
+            .Include(a => a.UploadedBy)
+            .FirstOrDefaultAsync(a => a.PublicId == attachmentPublicId, cancellationToken);
+        if (attachment is null)
+        {
+            return Failure.NotFound();
+        }
+
+        var access = await boardAccess.ResolveAsync(attachment.Card.List.Board.PublicId, callerPublicId, cancellationToken);
+        if (access is null)
+        {
+            return Failure.NotFound();
+        }
+
+        var isUploader = attachment.UploadedBy.PublicId == callerPublicId;
+        if (!CanRemoveAttachment(access.Role, isUploader))
+        {
+            return Failure.Forbidden();
+        }
+
+        var card = attachment.Card;
+        var fileName = attachment.FileName;
+        var storageKey = attachment.StorageKey;
+        db.Attachments.Remove(attachment);
+
+        var actor = await GetCallerAsync(callerPublicId, cancellationToken);
+        var activityEvent = NewEvent(card, actor.Id, callerPublicId, ActivityEventType.AttachmentRemoved, new { fileName });
+        db.ActivityEvents.Add(activityEvent);
+
+        await db.SaveChangesAsync(cancellationToken);
+
+        // contracts/attachments-api.md: best-effort after the row is committed — if physical
+        // deletion fails, the row is already gone and the file is orphaned but permanently
+        // inaccessible through the API, which satisfies FR-007's user-visible guarantee.
+        await attachmentStorage.DeleteAsync(storageKey, cancellationToken);
+
+        await PublishActivityEventAsync(card.List.Board.PublicId, activityEvent, callerPublicId, actor.DisplayName, cancellationToken);
+
+        return Result<Unit>.Success(Unit.Value);
+    }
+
     private static bool CanMutate(BoardRole role) => role is BoardRole.BoardAdmin or BoardRole.BoardMember;
+
+    // research.md R-5: the uploader may always remove their own attachment; otherwise only a
+    // BoardAdmin may — a non-uploading BoardMember, or an Observer, cannot.
+    private static bool CanRemoveAttachment(BoardRole role, bool isUploader) =>
+        role == BoardRole.BoardAdmin || isUploader;
 
     private async Task<ResolvedCard?> ResolveCardAsync(Guid cardPublicId, Guid callerPublicId, CancellationToken cancellationToken)
     {

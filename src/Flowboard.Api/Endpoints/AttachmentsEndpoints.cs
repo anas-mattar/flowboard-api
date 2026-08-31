@@ -38,6 +38,10 @@ public static class AttachmentsEndpoints
             .WithTags("Attachments")
             .RequireAuthorization();
 
+        endpoints.MapDelete("/v1/attachments/{attachmentPublicId:guid}", RemoveAttachment)
+            .WithTags("Attachments")
+            .RequireAuthorization();
+
         return endpoints;
     }
 
@@ -78,5 +82,18 @@ public static class AttachmentsEndpoints
         }
 
         return Results.File(result.Value.Content, result.Value.ContentType, result.Value.FileName);
+    }
+
+    private static async Task<IResult> RemoveAttachment(
+        Guid attachmentPublicId, ClaimsPrincipal caller, ICardService service, CancellationToken cancellationToken)
+    {
+        var callerPublicId = caller.GetUserPublicId();
+        if (callerPublicId is null)
+        {
+            return Results.Unauthorized();
+        }
+
+        var result = await service.RemoveAttachmentAsync(attachmentPublicId, callerPublicId.Value, cancellationToken);
+        return result.ToHttpResult();
     }
 }
