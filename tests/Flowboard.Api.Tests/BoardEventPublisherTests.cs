@@ -106,9 +106,21 @@ public sealed class BoardEventPublisherTests
         var tracker = new BoardConnectionTracker();
         tracker.AddConnection(boardPublicId, userPublicId, connectionId);
 
+        // Proves the interleaving actually happened, not merely that the test's final
+        // state is consistent with it having happened — EvictUserAsync unconditionally
+        // calls RemoveAllForBoardUser after eviction (BoardEventPublisher.cs:52), so an
+        // empty tracker at the end is not, by itself, evidence the race callback ran (the
+        // round-3 re-review's finding: deleting the callback invocation below would leave
+        // every other assertion in this test passing).
+        var raceCallbackRan = false;
+        var connectionStillTrackedWhenCallbackRan = false;
+
         var hub = new FakeHubContext();
         hub.ClientsImpl.ClientsProxy.OnSend = (_, _) =>
         {
+            raceCallbackRan = true;
+            connectionStillTrackedWhenCallbackRan =
+                tracker.GetConnectionIds(boardPublicId, userPublicId).Contains(connectionId);
             tracker.RemoveConnectionEverywhere(connectionId);
             return Task.CompletedTask;
         };
@@ -116,6 +128,11 @@ public sealed class BoardEventPublisherTests
         var publisher = new BoardEventPublisher(hub, tracker);
 
         await publisher.EvictUserAsync(boardPublicId, userPublicId, CancellationToken.None);
+
+        Assert.True(raceCallbackRan, "the race-simulation callback never ran — this test isn't exercising the disputed interleaving");
+        Assert.True(
+            connectionStillTrackedWhenCallbackRan,
+            "the connection was already gone from the tracker before the send even started — the race wasn't actually mid-flight");
 
         // The delivery attempt still targeted the connection that was live at the moment
         // of the snapshot — eviction never silently skips a connection just because a
