@@ -421,6 +421,63 @@ public sealed class BoardHubTests : IAsyncLifetime
         Assert.DoesNotContain(events, e => e.GetProperty("type").GetString() == "card.created");
     }
 
+    [Fact]
+    public async Task RemoveMember_ConcurrentDisconnectAtEvictionBoundary_ConvergesToNoAccessRegardlessOfRaceOutcome()
+    {
+        // human-pr-review.md (second-model adversarial review, 2026-08-31) disputed the
+        // §7 investigation's conclusion, citing a plausible race between
+        // BoardConnectionTracker.GetConnectionIds's snapshot (BoardEventPublisher.cs:45),
+        // BoardHub.OnDisconnectedAsync's concurrent RemoveConnectionEverywhere cleanup, and
+        // EvictConnectionsAsync's SendAsync/RemoveFromGroupAsync calls running against a
+        // connection id that may already be gone by the time they execute — noting that a
+        // completed SendAsync never proves client receipt. This test forces that exact race
+        // deliberately (rather than relying on manual reproduction) and asserts the outcome
+        // is safe under either interleaving: the DELETE that triggers eviction never
+        // throws/500s even if the connection is dying at the same instant, and — this is
+        // the actual FR-007 guarantee — a reconnect afterwards is always rejected, because
+        // JoinBoard re-resolves access independently of whichever path removed the old
+        // connection (invariant 5, "a valid token is not board access"). So even if the
+        // eviction snapshot goes stale and the access.revoked push never reaches a dying
+        // connection, the member can never end up with working board access again.
+        using var ownerClient = _factory.CreateClient();
+        var owner = await SignUpAsync(ownerClient, "HubRaceOwner");
+        Authorize(ownerClient, owner.Token);
+        var board = (await (await ownerClient.PostAsJsonAsync(
+            "/v1/boards", new CreateBoardRequestBody("Hub Race Board"))).Content.ReadFromJsonAsync<BoardCreatedDto>())!;
+
+        var (memberClient, member) = await InvitedClientAsync(ownerClient, board.PublicId, "HubRaceMember", "BoardMember");
+        var memberToken = await GetRealtimeTokenAsync(memberClient, board.PublicId);
+
+        var connection = BuildConnection(memberToken);
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinBoard", board.PublicId.ToString());
+
+        // Race the member's own disconnect against the server-side eviction triggered by
+        // removal — whichever ordering the runtime happens to pick, both operations must
+        // complete cleanly.
+        var removeTask = ownerClient.DeleteAsync($"/v1/boards/{board.PublicId}/members/{member.User.PublicId}");
+        var stopTask = connection.StopAsync();
+        await Task.WhenAll(removeTask, stopTask);
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removeTask).StatusCode);
+
+        // Regardless of which side of the race won, reconnecting with the same
+        // still-unexpired realtime token must be rejected — JoinBoard never trusts the
+        // token's board scoping alone.
+        var reconnected = BuildConnection(memberToken);
+        await reconnected.StartAsync();
+        try
+        {
+            await reconnected.InvokeAsync("JoinBoard", board.PublicId.ToString());
+        }
+        catch
+        {
+            // See JoinBoard_TokenBoardMismatch_ClosesConnection.
+        }
+
+        Assert.True(await WaitForCloseAsync(reconnected, TimeSpan.FromSeconds(10)));
+    }
+
     private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
