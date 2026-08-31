@@ -46,4 +46,6 @@ public sealed class Card
     public ICollection<ChecklistItem> ChecklistItems { get; set; } = new List<ChecklistItem>();
 
     public ICollection<Comment> Comments { get; set; } = new List<Comment>();
+
+    public ICollection<Attachment> Attachments { get; set; } = new List<Attachment>();
 }

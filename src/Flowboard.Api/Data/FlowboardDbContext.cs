@@ -32,6 +32,8 @@ public sealed class FlowboardDbContext(DbContextOptions<FlowboardDbContext> opti
 
     public DbSet<ActivityEvent> ActivityEvents => Set<ActivityEvent>();
 
+    public DbSet<Attachment> Attachments => Set<Attachment>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(FlowboardDbContext).Assembly);

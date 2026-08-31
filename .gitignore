@@ -6,6 +6,10 @@
 # dotenv files
 .env
 
+# LocalDiskAttachmentStorage's dev-default root (research.md R-1, plan.md ADR-40) —
+# runtime file bytes, never source.
+src/Flowboard.Api/App_Data/
+
 # User-specific files
 *.rsuser
 *.suo
