@@ -19,4 +19,6 @@ public static class ActivityEventType
     public const string ChecklistItemDeleted = "checklist.item.deleted";
     public const string CommentAdded = "comment.added";
     public const string CardMoved = "card.moved";
+    public const string AttachmentAdded = "attachment.added";
+    public const string AttachmentRemoved = "attachment.removed";
 }

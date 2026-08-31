@@ -28,6 +28,11 @@ builder.Services.AddScoped<IBoardContentService, BoardContentService>();
 builder.Services.AddScoped<ICardService, CardService>();
 builder.Services.AddScoped<IListService, ListService>();
 
+// plan.md ADR-40: local-disk-backed for now (research.md R-1) — no cloud object-store
+// account/config exists anywhere in this project yet. Stateless, matching TokenService's
+// singleton shape.
+builder.Services.AddSingleton<IAttachmentStorage, LocalDiskAttachmentStorage>();
+
 // plan.md ADR-32/ADR-33: this project's first realtime code — a per-board SignalR hub
 // plus the singleton connection tracker and publish/evict surface every mutating service
 // method calls after its own SaveChangesAsync() (research.md R-4/R-8: no backplane).
